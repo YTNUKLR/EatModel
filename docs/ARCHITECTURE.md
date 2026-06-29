@@ -390,6 +390,8 @@ Each phase should be independently useful. Don't build all six modules at once.
 - **2026-06-29** — Discovery DB uses **better-sqlite3 behind a repository layer** (no migration tooling yet); Drizzle adopted when the server/app lands — the repository interface, not the ORM, is the Postgres-swap seam.
 - **2026-06-29** — Receipt OCR uses **Claude vision + structured outputs** (`messages.parse` + `zodOutputFormat`) on `claude-opus-4-8`, behind the `ReceiptParser` interface; a `MockReceiptParser` lets the pipeline run with no API key.
 - **2026-06-29** — Adopted **engineering conventions** (see `docs/CONVENTIONS.md`): green-`main` + feature branches, TDD for the deterministic core via `node:test`, evals (not unit tests) for the LLM parser, dependencies point inward. Pure price-derivation logic extracted to `shared/pricing.ts` and tested.
+- **2026-06-29** — **Ingestion safety** (from a code review): `process-receipts` loads `.env` and the parser selection **fails loud** without a key (mock only via `process:mock`, never a silent fallback); **content-hash dedup** (UNIQUE `image_sha256` + a pre-parse `hasReceipt` check) makes re-runs idempotent and avoids re-billing the API on duplicates.
+- **2026-06-29** — Stopped **fabricating** price-observation date/unit — a missing purchase date or unit is stored as `null`, not "today"/"each" (per `CONVENTIONS.md §5`).
 
 ---
 
@@ -403,9 +405,33 @@ Deliberate simplifications in the first slice — recorded so they aren't mistak
   over-fragment; that's expected.
 - **`unitPrice` falls back to `lineTotal`** when a line has no quantity. So a whole-package price can be
   recorded as if per-unit. Fine for trend-spotting; revisit before serious cost-per-nutrient math.
-- **`observed_at` defaults to today** when the receipt date is illegible — price points may be mis-dated.
+- **Uncertain values are stored, not fabricated** *(fixed 2026-06-29)*. A missing purchase date or
+  unit is recorded as `null` (not "today"/"each"); the price is still recorded when known. Reporting
+  must handle null dates/units.
 - **HEIC/HEIF is auto-converted on macOS only.** iPhone photos are often HEIC, which Claude vision
   rejects; the CLI converts them to a temporary JPEG via `sips` (keeping the original) before parsing.
   On non-macOS platforms HEIC fails per-file with a clear message — convert manually or capture JPEG.
 - **No reporting yet.** Data accumulates in SQLite but there's no trend/price-history view — that's the
   next build (§7 Phase 3).
+
+---
+
+## 13. Code review findings (2026-06-29) & status
+
+A review of the discovery slice surfaced five issues; status tracked here.
+
+| # | Severity | Finding | Status |
+|---|---|---|---|
+| 1 | High | `.env` documented but not loaded → `process` silently used the mock and saved canned data | **Fixed** — loads `.env`, fails loud without a key |
+| 2 | High | Not idempotent; no image fingerprint → re-runs duplicate rows | **Fixed** — content-hash dedup + UNIQUE `image_sha256` |
+| 4 | Medium | Fabricated facts (date→today, unit→"each") — contradicted `CONVENTIONS.md §5` | **Fixed** — stores `null` instead |
+| 3 | Medium | Loose zod validation lets bad LLM output (empty/negative/odd) become facts | **Queued** — see below |
+| 5 | Medium | Exact-alias-or-create hardens unconfirmed ingredients into the spine | **Queued** — see below |
+
+**Queued — "boundary hardening + review staging" (next chunk):**
+- **#3** tighten the *safe, universal* validations at the schema (`description.trim().min(1)`,
+  non-negative finite prices/quantities) but do the rest as **normalize-or-quarantine at the DB
+  boundary** — strict whole-object schema would reject an entire receipt over one odd line, so flag
+  questionable lines for review instead of dropping the receipt or silently promoting them.
+- **#5** add a lightweight review/`needs_review` gate so freshly-minted (`match_confidence = 'new'`)
+  ingredients don't harden into the spine before a human confirms — full fuzzy matching stays Phase 3.

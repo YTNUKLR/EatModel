@@ -84,6 +84,36 @@ test("derives a unit price from line total ÷ quantity when none is printed", ()
   db.close();
 });
 
+test("tracks ingested image hashes for idempotency", () => {
+  const db = freshDb();
+  assert.equal(db.hasReceipt("abc123"), false);
+  db.saveReceipt(receipt([line("Chicken thighs", { unitPrice: 2.49 })]), "a.jpg", "mock", "abc123");
+  assert.equal(db.hasReceipt("abc123"), true);
+  assert.equal(db.hasReceipt("other"), false);
+  db.close();
+});
+
+test("the unique image hash backstops double ingestion", () => {
+  const db = freshDb();
+  db.saveReceipt(receipt([line("Spinach", { unitPrice: 3.99 })]), "a.jpg", "mock", "dup");
+  assert.throws(() =>
+    db.saveReceipt(receipt([line("Spinach", { unitPrice: 3.99 })]), "a.jpg", "mock", "dup"),
+  );
+  db.close();
+});
+
+test("does not fabricate a unit when the receipt omits it", () => {
+  const db = freshDb();
+  const summary = db.saveReceipt(
+    receipt([line("Loose item", { unitPrice: 1.0 })]), // unit omitted
+    "a.jpg",
+    "mock",
+  );
+  assert.equal(summary.lines[0]?.unit, null); // not "each"
+  assert.equal(summary.lines[0]?.pricedObserved, true);
+  db.close();
+});
+
 test("records the line but no price observation when nothing is priced", () => {
   const db = freshDb();
   const summary = db.saveReceipt(receipt([line("Mystery item")]), "a.jpg", "mock");

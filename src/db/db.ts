@@ -38,6 +38,7 @@ CREATE TABLE IF NOT EXISTS receipts (
   total          REAL,
   currency       TEXT,
   image_filename TEXT,
+  image_sha256   TEXT UNIQUE,
   parser         TEXT,
   raw_json       TEXT,
   parsed_at      TEXT NOT NULL DEFAULT (datetime('now'))
@@ -123,18 +124,34 @@ export class Db {
     return { ingredientId, confidence: "new" };
   }
 
+  /** True if a receipt with this image content hash has already been ingested. */
+  hasReceipt(imageSha256: string): boolean {
+    return (
+      this.db.prepare("SELECT 1 FROM receipts WHERE image_sha256 = ? LIMIT 1").get(imageSha256) !==
+      undefined
+    );
+  }
+
   /**
    * Persist a parsed receipt: the receipt row, each line item (matched to an
    * ingredient), and a price observation per priced line. Wrapped in one
    * transaction so a partial receipt never lands in the db.
+   *
+   * `imageSha256` is the content hash of the source image; the UNIQUE column is
+   * a backstop against double ingestion (the CLI also checks `hasReceipt` first).
    */
-  saveReceipt(parsed: ReceiptParseResult, imageFilename: string, parser: string): SaveSummary {
+  saveReceipt(
+    parsed: ReceiptParseResult,
+    imageFilename: string,
+    parser: string,
+    imageSha256: string | null = null,
+  ): SaveSummary {
     const run = this.db.transaction((): SaveSummary => {
       const receiptId = Number(
         this.db
           .prepare(
-            `INSERT INTO receipts (store, purchased_at, total, currency, image_filename, parser, raw_json)
-             VALUES (?, ?, ?, ?, ?, ?, ?)`,
+            `INSERT INTO receipts (store, purchased_at, total, currency, image_filename, image_sha256, parser, raw_json)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
           )
           .run(
             parsed.store,
@@ -142,12 +159,15 @@ export class Db {
             parsed.total,
             parsed.currency,
             imageFilename,
+            imageSha256,
             parser,
             JSON.stringify(parsed),
           ).lastInsertRowid,
       );
 
-      const observedAt = parsed.purchasedAt ?? new Date().toISOString().slice(0, 10);
+      // Don't fabricate a purchase date — record what was read (possibly null).
+      // The price itself is known; the *when* may not be. (CONVENTIONS.md §5)
+      const observedAt = parsed.purchasedAt;
       const lines: LineOutcome[] = [];
       let newIngredients = 0;
       let priceObservations = 0;
@@ -177,8 +197,9 @@ export class Db {
         );
 
         // Per-unit price: explicit if printed, else derived (see shared/pricing).
+        // Don't fabricate a unit either — store what was read, null if absent.
         const unitPrice = deriveUnitPrice(line);
-        const unit = line.unit ?? "each";
+        const unit = line.unit;
 
         let pricedObserved = false;
         if (unitPrice != null) {
