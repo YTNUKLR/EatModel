@@ -68,6 +68,21 @@ Processed images move to the matching `processed/` folder; data lands in `data/e
 anytime — each inbox is drained per pass, and re-ingesting the same photo is a no-op (content-hash
 dedup). `npm run db:reset` clears the database.
 
+## Review what was ingested
+
+New ingredients land as **unconfirmed**, and any untrustworthy line (empty name, negative price) or a
+receipt whose items don't reconcile against its total is **flagged** rather than silently trusted
+(see `docs/ARCHITECTURE.md` §5.5). Inspect and resolve:
+
+```sh
+npm run review                       # list unconfirmed ingredients, flagged lines, unreconciled receipts
+npm run review -- confirm <id>       # mark an ingredient trusted
+npm run review -- merge <from> <into>  # fold a duplicate/abbreviation into its real ingredient
+```
+
+`merge` is how you de-fragment the spine by hand (e.g. fold `CHKN THGH` into `chicken thighs`) until
+automatic fuzzy matching arrives.
+
 > iPhone photos are often HEIC, which Claude vision doesn't accept directly. On **macOS** the CLI
 > auto-converts HEIC/HEIF to a temporary JPEG (via the built-in `sips`) before parsing, and keeps the
 > original file. On other platforms, convert first (or set the iPhone camera to **Settings ▸ Camera ▸

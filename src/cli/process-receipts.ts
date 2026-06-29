@@ -44,11 +44,13 @@ function printReceipt(
     const price = line.pricedObserved
       ? `${money(line.unitPrice, parsed.currency)}${line.unit ? `/${line.unit}` : ""}`
       : "no price";
-    console.log(`    [${tag}] ${line.description}  ·  ${price}`);
+    const flag = line.needsReview ? "  ⚠ review" : "";
+    console.log(`    [${tag}] ${line.description}  ·  ${price}${flag}`);
   }
+  const reviewNote = summary.needsReview ? `  ⚠ needs review: ${summary.reviewReason}` : "";
   console.log(
     `    saved receipt #${summary.receiptId}: ${summary.lines.length} line(s), ` +
-      `${summary.newIngredients} new ingredient(s), ${summary.priceObservations} price observation(s)\n`,
+      `${summary.newIngredients} new ingredient(s), ${summary.priceObservations} price observation(s)${reviewNote}\n`,
   );
 }
 

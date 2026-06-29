@@ -43,10 +43,14 @@ function printPage(
     for (const line of r.lines) {
       const tag = line.confidence === "new" ? "＋new" : " alias";
       const opt = line.optional ? "  (optional)" : "";
-      console.log(`        [${tag}] ${line.ingredient}${opt}`);
+      const flag = line.needsReview ? "  ⚠ review" : "";
+      console.log(`        [${tag}] ${line.ingredient}${opt}${flag}`);
     }
   });
-  console.log(`    ${summary.newIngredients} new ingredient(s) across the page\n`);
+  console.log(
+    `    ${summary.newIngredients} new ingredient(s) across the page` +
+      `  ·  run \`npm run review\` to confirm/merge them\n`,
+  );
 }
 
 async function main(): Promise<void> {

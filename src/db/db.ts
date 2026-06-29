@@ -3,6 +3,7 @@ import path from "node:path";
 import Database from "better-sqlite3";
 import { normalizeName } from "../shared/units";
 import { deriveUnitPrice } from "../shared/pricing";
+import { isSaneNumber, reviewLineReason, reconcileReceiptTotal } from "../shared/review";
 import type { ReceiptParseResult } from "../shared/types";
 import type { RecipeParseResult, RecipePage } from "../shared/recipe-types";
 
@@ -19,6 +20,9 @@ CREATE TABLE IF NOT EXISTS ingredients (
   id             INTEGER PRIMARY KEY AUTOINCREMENT,
   canonical_name TEXT NOT NULL,
   category       TEXT,
+  -- Review gate: a freshly-minted ingredient is 'unconfirmed' until a human
+  -- confirms (or merges) it, so unreviewed matches don't harden into the spine.
+  status         TEXT NOT NULL DEFAULT 'unconfirmed',
   created_at     TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
@@ -42,6 +46,9 @@ CREATE TABLE IF NOT EXISTS receipts (
   image_sha256   TEXT UNIQUE,
   parser         TEXT,
   raw_json       TEXT,
+  -- Set when line items don't reconcile against the printed total (see review).
+  needs_review   INTEGER NOT NULL DEFAULT 0,
+  review_reason  TEXT,
   parsed_at      TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
@@ -55,7 +62,10 @@ CREATE TABLE IF NOT EXISTS receipt_line_items (
   unit_price       REAL,
   line_total       REAL,
   ingredient_id    INTEGER REFERENCES ingredients(id),
-  match_confidence TEXT
+  match_confidence TEXT,
+  -- Flagged (not dropped) when a value is untrustworthy — empty name, negative price, etc.
+  needs_review     INTEGER NOT NULL DEFAULT 0,
+  review_reason    TEXT
 );
 
 -- The append-only price fact table. Everything cost-related builds on this.
@@ -103,7 +113,10 @@ CREATE TABLE IF NOT EXISTS recipe_ingredients (
   prep_note        TEXT,
   optional         INTEGER,
   ingredient_id    INTEGER REFERENCES ingredients(id),
-  match_confidence TEXT
+  match_confidence TEXT,
+  -- Flagged (not dropped) when a value is untrustworthy — empty name, negative qty.
+  needs_review     INTEGER NOT NULL DEFAULT 0,
+  review_reason    TEXT
 );
 `;
 
@@ -116,6 +129,7 @@ export interface LineOutcome {
   unitPrice: number | null;
   unit: string | null;
   pricedObserved: boolean;
+  needsReview: boolean;
 }
 
 export interface SaveSummary {
@@ -123,6 +137,9 @@ export interface SaveSummary {
   lines: LineOutcome[];
   newIngredients: number;
   priceObservations: number;
+  /** True if the receipt's line items didn't reconcile against the total. */
+  needsReview: boolean;
+  reviewReason: string | null;
 }
 
 export interface RecipeLineOutcome {
@@ -130,6 +147,7 @@ export interface RecipeLineOutcome {
   ingredientId: number;
   confidence: MatchConfidence;
   optional: boolean;
+  needsReview: boolean;
 }
 
 export interface SaveRecipeSummary {
@@ -144,6 +162,28 @@ export interface SaveRecipePageSummary {
   recipes: SaveRecipeSummary[];
   /** New canonical ingredients minted across the whole page. */
   newIngredients: number;
+}
+
+/** An ingredient awaiting human confirmation (review gate). */
+export interface UnconfirmedIngredient {
+  id: number;
+  canonicalName: string;
+  aliases: number;
+}
+
+/** A flagged line surfaced by the review CLI. */
+export interface ReviewLine {
+  source: "receipt" | "recipe";
+  lineId: number;
+  description: string;
+  reason: string;
+}
+
+/** A receipt whose totals didn't reconcile. */
+export interface ReviewReceipt {
+  id: number;
+  store: string | null;
+  reason: string;
 }
 
 export class Db {
@@ -197,6 +237,24 @@ export class Db {
       this.db.exec(
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_receipts_image_sha256 ON receipts(image_sha256)",
       );
+    }
+
+    // Review-gate columns. ALTER ADD COLUMN with a DEFAULT backfills existing
+    // rows safely (pre-gate ingredients become 'unconfirmed', which is correct —
+    // they were never reviewed).
+    const reviewColumns: [string, string, string][] = [
+      ["ingredients", "status", "TEXT NOT NULL DEFAULT 'unconfirmed'"],
+      ["receipts", "needs_review", "INTEGER NOT NULL DEFAULT 0"],
+      ["receipts", "review_reason", "TEXT"],
+      ["receipt_line_items", "needs_review", "INTEGER NOT NULL DEFAULT 0"],
+      ["receipt_line_items", "review_reason", "TEXT"],
+      ["recipe_ingredients", "needs_review", "INTEGER NOT NULL DEFAULT 0"],
+      ["recipe_ingredients", "review_reason", "TEXT"],
+    ];
+    for (const [table, column, decl] of reviewColumns) {
+      if (this.tableExists(table) && !this.columnExists(table, column)) {
+        this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${decl}`);
+      }
     }
   }
 
@@ -273,6 +331,7 @@ export class Db {
       // The price itself is known; the *when* may not be. (CONVENTIONS.md §5)
       const observedAt = parsed.purchasedAt;
       const lines: LineOutcome[] = [];
+      const validLineTotals: number[] = [];
       let newIngredients = 0;
       let priceObservations = 0;
 
@@ -280,12 +339,19 @@ export class Db {
         const { ingredientId, confidence } = this.matchIngredient(line.description, "receipt");
         if (confidence === "new") newIngredients++;
 
+        // Flag (don't drop) lines with untrustworthy values — §5.5.
+        const reason = reviewLineReason(line.description, [
+          { label: "quantity", value: line.quantity },
+          { label: "unitPrice", value: line.unitPrice },
+          { label: "lineTotal", value: line.lineTotal },
+        ]);
+
         const lineId = Number(
           this.db
             .prepare(
               `INSERT INTO receipt_line_items
-                 (receipt_id, raw_text, description, quantity, unit, unit_price, line_total, ingredient_id, match_confidence)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                 (receipt_id, raw_text, description, quantity, unit, unit_price, line_total, ingredient_id, match_confidence, needs_review, review_reason)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
             )
             .run(
               receiptId,
@@ -297,6 +363,8 @@ export class Db {
               line.lineTotal,
               ingredientId,
               confidence,
+              reason ? 1 : 0,
+              reason,
             ).lastInsertRowid,
         );
 
@@ -305,8 +373,10 @@ export class Db {
         const unitPrice = deriveUnitPrice(line);
         const unit = line.unit;
 
+        // Only record a price observation from a sane, non-flagged price — a
+        // bad price must never become a "fact" downstream cost math trusts.
         let pricedObserved = false;
-        if (unitPrice != null) {
+        if (unitPrice != null && isSaneNumber(unitPrice) && !reason) {
           this.db
             .prepare(
               `INSERT INTO price_observations
@@ -318,6 +388,10 @@ export class Db {
           pricedObserved = true;
         }
 
+        if (line.lineTotal != null && isSaneNumber(line.lineTotal)) {
+          validLineTotals.push(line.lineTotal);
+        }
+
         lines.push({
           description: line.description,
           ingredientId,
@@ -325,10 +399,26 @@ export class Db {
           unitPrice,
           unit,
           pricedObserved,
+          needsReview: reason != null,
         });
       }
 
-      return { receiptId, lines, newIngredients, priceObservations };
+      // Receipt-level sanity: do the line items reconcile against the total?
+      const reviewReason = reconcileReceiptTotal(parsed.total, validLineTotals);
+      if (reviewReason) {
+        this.db
+          .prepare("UPDATE receipts SET needs_review = 1, review_reason = ? WHERE id = ?")
+          .run(reviewReason, receiptId);
+      }
+
+      return {
+        receiptId,
+        lines,
+        newIngredients,
+        priceObservations,
+        needsReview: reviewReason != null,
+        reviewReason,
+      };
     });
 
     return run();
@@ -390,11 +480,16 @@ export class Db {
             pageNewIngredients++;
           }
 
+          // Flag (don't drop) lines with untrustworthy values — §5.5.
+          const reason = reviewLineReason(line.ingredient, [
+            { label: "quantity", value: line.quantity },
+          ]);
+
           this.db
             .prepare(
               `INSERT INTO recipe_ingredients
-                 (recipe_id, raw_text, ingredient_text, quantity, unit, prep_note, optional, ingredient_id, match_confidence)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                 (recipe_id, raw_text, ingredient_text, quantity, unit, prep_note, optional, ingredient_id, match_confidence, needs_review, review_reason)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
             )
             .run(
               recipeId,
@@ -406,6 +501,8 @@ export class Db {
               line.optional ? 1 : 0,
               ingredientId,
               confidence,
+              reason ? 1 : 0,
+              reason,
             );
 
           lines.push({
@@ -413,6 +510,7 @@ export class Db {
             ingredientId,
             confidence,
             optional: line.optional,
+            needsReview: reason != null,
           });
         }
 
@@ -439,6 +537,84 @@ export class Db {
     const only = page.recipes[0];
     if (!only) throw new Error("saveRecipe: page produced no recipe");
     return only;
+  }
+
+  // --- Review gate (§5.5) -------------------------------------------------
+
+  /** Ingredients still awaiting human confirmation, newest first. */
+  listUnconfirmedIngredients(): UnconfirmedIngredient[] {
+    return this.db
+      .prepare(
+        `SELECT i.id AS id, i.canonical_name AS canonicalName,
+                (SELECT COUNT(*) FROM ingredient_aliases a WHERE a.ingredient_id = i.id) AS aliases
+         FROM ingredients i
+         WHERE i.status = 'unconfirmed'
+         ORDER BY i.id DESC`,
+      )
+      .all() as UnconfirmedIngredient[];
+  }
+
+  /** Flagged receipt + recipe lines, for the review CLI. */
+  listLinesNeedingReview(): ReviewLine[] {
+    const receipt = this.db
+      .prepare(
+        `SELECT id AS lineId, description, review_reason AS reason
+         FROM receipt_line_items WHERE needs_review = 1 ORDER BY id`,
+      )
+      .all() as { lineId: number; description: string | null; reason: string }[];
+    const recipe = this.db
+      .prepare(
+        `SELECT id AS lineId, ingredient_text AS description, review_reason AS reason
+         FROM recipe_ingredients WHERE needs_review = 1 ORDER BY id`,
+      )
+      .all() as { lineId: number; description: string | null; reason: string }[];
+    return [
+      ...receipt.map((r) => ({ source: "receipt" as const, ...r, description: r.description ?? "" })),
+      ...recipe.map((r) => ({ source: "recipe" as const, ...r, description: r.description ?? "" })),
+    ];
+  }
+
+  /** Receipts whose line items didn't reconcile against the total. */
+  listReceiptsNeedingReview(): ReviewReceipt[] {
+    return this.db
+      .prepare(
+        `SELECT id, store, review_reason AS reason
+         FROM receipts WHERE needs_review = 1 ORDER BY id`,
+      )
+      .all() as ReviewReceipt[];
+  }
+
+  /** Confirm an ingredient — it's now a trusted part of the spine. */
+  confirmIngredient(id: number): void {
+    const res = this.db.prepare("UPDATE ingredients SET status = 'confirmed' WHERE id = ?").run(id);
+    if (res.changes === 0) throw new Error(`no ingredient with id ${id}`);
+  }
+
+  /**
+   * Merge a duplicate/fragment ingredient into another — the remedy for spine
+   * fragmentation (e.g. fold "SR FLOUR" into "self-raising flour"). Re-points
+   * every alias, line, and price observation from `fromId` to `intoId`, then
+   * deletes the now-empty source. One transaction.
+   */
+  mergeIngredient(fromId: number, intoId: number): void {
+    if (fromId === intoId) throw new Error("cannot merge an ingredient into itself");
+    const exists = (id: number) =>
+      this.db.prepare("SELECT 1 FROM ingredients WHERE id = ?").get(id) !== undefined;
+    this.db.transaction(() => {
+      if (!exists(fromId)) throw new Error(`no ingredient with id ${fromId}`);
+      if (!exists(intoId)) throw new Error(`no ingredient with id ${intoId}`);
+      for (const table of [
+        "ingredient_aliases",
+        "receipt_line_items",
+        "recipe_ingredients",
+        "price_observations",
+      ]) {
+        this.db
+          .prepare(`UPDATE ${table} SET ingredient_id = ? WHERE ingredient_id = ?`)
+          .run(intoId, fromId);
+      }
+      this.db.prepare("DELETE FROM ingredients WHERE id = ?").run(fromId);
+    })();
   }
 
   /** Quick counts for the end-of-run summary. */

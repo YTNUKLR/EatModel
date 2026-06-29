@@ -319,6 +319,36 @@ with receipt phrasing (`"GV CHKN THGH"`). That gap is discovery output, not a re
 The same seams persist into the real app: the synced folder → an upload endpoint, the CLI → a worker,
 the `RecipeParser` and repository interfaces unchanged.
 
+### 5.5 The review / confidence gate
+
+The make-or-break risk (§4.2) is that messy, fragmented, or wrong data **hardens into the spine** as it
+accumulates — and unlike an extraction gap (re-derivable from the retained image), a bad *identity*
+decision is expensive to unwind later. The gate is the seam that keeps provisional data provisional.
+Two mechanisms, both deliberately *flag, never drop*:
+
+**1. Ingredient staging (the #5 concern).** A freshly-minted ingredient is created with
+`status = 'unconfirmed'`. It still accrues aliases/prices/recipe links immediately (nothing is
+blocked), but it's visibly provisional until a human acts. Two actions resolve it:
+- `confirmIngredient(id)` — promote it to a trusted part of the spine.
+- `mergeIngredient(fromId, intoId)` — fold a fragment into its real identity (e.g. `"SR FLOUR"` →
+  `"self-raising flour"`), re-pointing every alias, line, and price observation, then deleting the
+  source. **This is the concrete remedy for the exact-match fragmentation in §12** — until fuzzy
+  matching lands (Phase 3), merge is how the spine de-fragments.
+
+**2. Boundary validation (the #3 concern), normalize-or-flag.** At persist time each line is checked
+(`shared/review.ts`, pure + tested): an empty name or a negative/non-finite quantity/price sets the
+line's `needs_review` flag with a reason. The line is **still stored** — one odd line must not sink an
+entire receipt — but a flagged price is **not** promoted to a `price_observation` (a bad number must
+never become a cost "fact"). Receipts also get a cheap **total reconciliation**: if the line items sum
+to *more* than the printed total (a double-count/misread — tax only makes the total larger) or *far
+below* it (likely missed lines), the receipt is flagged. Advisory, not authoritative — discounts can
+cause benign overshoots.
+
+**Surfacing it.** The ingest CLIs mark flagged lines inline (`⚠ review`); `npm run review` lists
+unconfirmed ingredients, flagged lines, and unreconciled receipts, and performs `confirm` / `merge`.
+A real review UI later calls the same repository methods. Full fuzzy/embedding matching stays Phase 3;
+this gate is the human-in-the-loop scaffold it will eventually feed.
+
 ---
 
 ## 6. Nutrition data model
@@ -439,6 +469,8 @@ Each phase should be independently useful. Don't build all six modules at once.
 - **2026-06-29** — **One image → many recipes** (found on the first real cookbook photo, which had two recipes side by side): `RecipeParser` returns a `RecipePage` (list of recipes), and persistence splits into `recipe_ingests` (the image — UNIQUE content hash / dedup lives here) → many `recipes`. Preserves the idempotency backstop while a page fans out to N recipes. Validated end-to-end: both recipes landed, and an ingredient shared across the two ("salt") resolved to one canonical entry.
 - **2026-06-29** — **Discovery-phase schema migration** (from a code review): `CREATE TABLE IF NOT EXISTS` never alters existing tables, so an older db silently lacked newer columns and would crash on insert. `Db` now runs a tiny `migrate()` on open — additively `ALTER TABLE ADD COLUMN` where safe (e.g. `receipts.image_sha256` + a UNIQUE index), and for structurally-incompatible old schemas (a pre-page `recipes` table with no `ingest_id`) **fails loud telling the user to `npm run db:reset`**. Full migration tooling still deferred (Drizzle, when the server lands).
 - **2026-06-29** — **Ingest hardening** (same review): (a) processed/quarantined files are **hash-prefixed** (`<sha12>-<name>`) so two different images sharing a basename (`IMG_0001.jpg`) can't overwrite each other — honoring "keep originals for re-parse"; (b) a parse that yields **zero recipes / zero line items is quarantined** to a `failed/` folder, not saved — saving an empty result would dedup the image as "done" and re-billing could never re-extract it.
+- **2026-06-29** — **Review / confidence gate** (§5.5) built (closes review findings #3 + #5). New ingredients persist as `status='unconfirmed'` and are promoted via `confirmIngredient` or de-fragmented via `mergeIngredient` (the concrete remedy for exact-match fragmentation until Phase 3 fuzzy matching). Boundary validation **flags, never drops**: untrustworthy lines get a `needs_review` reason and are excluded from price observations, but still stored (one bad line can't sink a receipt). Receipts get a cheap **total reconciliation** (lines exceeding the total, or far below it, flag the receipt). Surfaced via `⚠ review` in the ingest CLIs and a `npm run review` CLI (list / confirm / merge). Validation logic is pure + tested in `shared/review.ts`.
+- **2026-06-29** — **Guiding principle for "handle it now vs later":** because every ingest **retains the original image + `raw_json`**, almost any *extraction* gap (units, fractions, sub-sections, discounts) is re-derivable by re-parsing and can be safely deferred. What's *not* cheaply reversible is **identity and accumulated human judgment** (how lines resolve to the spine; confirmations) — so those get handled now (the gate), and the rest is logged as backlog (§14).
 
 ---
 
@@ -462,9 +494,10 @@ Deliberate simplifications in the first slice — recorded so they aren't mistak
   next build (§7 Phase 3).
 - **Recipe lines fragment the spine, and across sources too.** Recipe ingredients use the same
   exact-alias-or-create matcher (§5.4), so recipe phrasing rarely converges with receipt phrasing yet
-  (`"boneless skinless chicken thighs"` ≠ `"GV CHKN THGH"`). Until fuzzy/embedding matching + a review
-  queue (#3/#5, §13; full matching in §7 Phase 3), the spine over-fragments — expected, and exactly the
-  signal this slice exists to surface.
+  (`"boneless skinless chicken thighs"` ≠ `"GV CHKN THGH"`). Automatic convergence waits for
+  fuzzy/embedding matching (§7 Phase 3); **in the meantime `mergeIngredient` (the review gate, §5.5)
+  is the manual remedy** — fold fragments together by hand. Over-fragmentation is expected and is
+  exactly the signal this slice exists to surface.
 - **Recipe steps are not captured (ingredients-list-first).** v1 extracts title/source/servings/
   ingredients only. The original image and `raw_json` are retained, so instructions can be re-parsed
   later without re-photographing.
@@ -480,13 +513,37 @@ A review of the discovery slice surfaced five issues; status tracked here.
 | 1 | High | `.env` documented but not loaded → `process` silently used the mock and saved canned data | **Fixed** — loads `.env`, fails loud without a key |
 | 2 | High | Not idempotent; no image fingerprint → re-runs duplicate rows | **Fixed** — content-hash dedup + UNIQUE `image_sha256` |
 | 4 | Medium | Fabricated facts (date→today, unit→"each") — contradicted `CONVENTIONS.md §5` | **Fixed** — stores `null` instead |
-| 3 | Medium | Loose zod validation lets bad LLM output (empty/negative/odd) become facts | **Queued** — see below |
-| 5 | Medium | Exact-alias-or-create hardens unconfirmed ingredients into the spine | **Queued** — see below |
+| 3 | Medium | Loose zod validation lets bad LLM output (empty/negative/odd) become facts | **Fixed** — §5.5 boundary validation (flag, don't drop; flagged prices never become observations) |
+| 5 | Medium | Exact-alias-or-create hardens unconfirmed ingredients into the spine | **Fixed** — §5.5 staging (`status='unconfirmed'` + confirm/merge) |
 
-**Queued — "boundary hardening + review staging" (next chunk):**
-- **#3** tighten the *safe, universal* validations at the schema (`description.trim().min(1)`,
-  non-negative finite prices/quantities) but do the rest as **normalize-or-quarantine at the DB
-  boundary** — strict whole-object schema would reject an entire receipt over one odd line, so flag
-  questionable lines for review instead of dropping the receipt or silently promoting them.
-- **#5** add a lightweight review/`needs_review` gate so freshly-minted (`match_confidence = 'new'`)
-  ingredients don't harden into the spine before a human confirms — full fuzzy matching stays Phase 3.
+Both #3 and #5 were resolved together by the **review / confidence gate (§5.5)** — boundary validation
+flags untrustworthy lines (never dropping a whole receipt, never promoting a bad price to a fact), and
+ingredient staging keeps new entries provisional until confirmed or merged.
+
+---
+
+## 14. Backlog — known recipe/receipt edge cases (deferred, mostly retro-fixable)
+
+Surfaced while ingesting the first real images, kept here so they aren't forgotten. The triage rule is
+the principle in the §11 log (2026-06-29): **we retain the original image + `raw_json` for every
+ingest, so most _extraction_ gaps can be re-derived later by re-parsing** — those are safe to defer.
+What gets pulled forward is anything touching **identity** (the spine) or **accumulated judgment**,
+because that's expensive to unwind once data piles up.
+
+**Next identity decision (do before it accumulates):**
+- **Store identity for receipts.** `receipts.store` is free text today — `WAL-MART #1234` / `Walmart` /
+  `WM SUPERCENTER` will never group, which blocks "which store is cheapest." Needs a canonical *store*
+  spine mirroring the ingredient spine (raw store text is retained, so retrofittable, but it's the same
+  *class* of decision as the ingredient spine — worth doing deliberately and soon).
+
+**Deferred — retro-fixable from the retained image/JSON:**
+
+| Area | Edge case | Why it can wait |
+|---|---|---|
+| Matching | Fuzzy/embedding matching so `CHKN THGH` ≈ `chicken thighs` automatically | Algorithm over retained data; the §5.5 `merge` tool covers it manually until **Phase 3**. |
+| Units | Heterogeneous units — `g`/`ml`/`tbsp`/`"1 can"`/`"to taste"`/`"dash"`; mixed like `1 lb 4½ oz` | Pure conversion functions over `raw_text`; prerequisite for nutrition & cost math (§4.2 #2). |
+| Recipes | Sub-sections (`"For the sauce: …"`), ranges (`2–3 cloves`), `to taste` | Additive `section` field / range handling; re-parse when it matters. |
+| Receipts | Discounts/coupons/multi-buy → recorded gross price ≠ net paid | Affects cost accuracy; re-derivable from the receipt image. (Reconciliation §5.5 already flags gross > total.) |
+| Receipts | `unitPrice` falls back to `lineTotal` when quantity is absent (whole-package price as per-unit) | Fine for trend-spotting; revisit before serious cost-per-unit math. |
+| Both | Cross-photo duplicate (same recipe/receipt re-shot → different hash, not deduped) | Content-hash can't catch it; title/line similarity is a later nicety. |
+| Recipes | Steps/instructions not captured (ingredients-list-first) | Original image retained; re-parse when the cooking/preservation phase lands. |

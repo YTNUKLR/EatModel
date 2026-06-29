@@ -252,3 +252,79 @@ test("a whole multi-recipe page dedups on the one image hash", () => {
   assert.throws(() => db.saveRecipePage(spread, "spread.jpg", "mock", "h"));
   db.close();
 });
+
+// --- Review gate ---------------------------------------------------------
+
+test("new ingredients start unconfirmed and confirm() promotes them", () => {
+  const db = freshDb();
+  db.saveReceipt(receipt([line("Chicken thighs", { unitPrice: 2.49 })]), "a.jpg", "mock");
+
+  const before = db.listUnconfirmedIngredients();
+  assert.equal(before.length, 1);
+  assert.equal(before[0]?.canonicalName, "Chicken thighs");
+
+  db.confirmIngredient(before[0]!.id);
+  assert.equal(db.listUnconfirmedIngredients().length, 0); // no longer pending
+  db.close();
+});
+
+test("a flagged line is stored but never becomes a price observation", () => {
+  const db = freshDb();
+  // Empty description and a negative price — both untrustworthy.
+  const summary = db.saveReceipt(
+    receipt([line("", { unitPrice: -2 })]),
+    "a.jpg",
+    "mock",
+  );
+
+  assert.equal(summary.lines[0]?.needsReview, true);
+  assert.equal(summary.lines[0]?.pricedObserved, false); // not trusted as a fact
+  assert.equal(summary.priceObservations, 0);
+  assert.equal(db.totals().priceObservations, 0);
+
+  const flagged = db.listLinesNeedingReview();
+  assert.equal(flagged.length, 1);
+  assert.equal(flagged[0]?.source, "receipt");
+  db.close();
+});
+
+test("a receipt whose lines exceed the total is flagged for review", () => {
+  const db = freshDb();
+  const r: ReceiptParseResult = {
+    store: "Test Mart",
+    purchasedAt: "2026-06-20",
+    total: 5.0,
+    currency: "USD",
+    lines: [line("A", { lineTotal: 3.74 }), line("B", { lineTotal: 3.99 })], // sum 7.73 > 5.00
+  };
+  const summary = db.saveReceipt(r, "a.jpg", "mock");
+
+  assert.equal(summary.needsReview, true);
+  assert.match(summary.reviewReason ?? "", /exceed/);
+  assert.equal(db.listReceiptsNeedingReview().length, 1);
+  db.close();
+});
+
+test("merge folds a fragment ingredient into another, preserving price history", () => {
+  const db = freshDb();
+  db.saveReceipt(receipt([line("Chicken thighs", { unitPrice: 2.49 })]), "a.jpg", "mock");
+  db.saveReceipt(receipt([line("Chicken thigh", { unitPrice: 2.59 })]), "b.jpg", "mock");
+  assert.equal(db.totals().ingredients, 2); // fragmented: didn't converge on exact match
+
+  const [frag, keep] = db.listUnconfirmedIngredients(); // newest first: "Chicken thigh", "Chicken thighs"
+  db.mergeIngredient(frag!.id, keep!.id);
+
+  const totals = db.totals();
+  assert.equal(totals.ingredients, 1); // de-fragmented
+  assert.equal(totals.priceObservations, 2); // both observations survive under the kept ingredient
+  db.close();
+});
+
+test("merge rejects self-merge and unknown ids", () => {
+  const db = freshDb();
+  db.saveReceipt(receipt([line("Salt", { unitPrice: 1 })]), "a.jpg", "mock");
+  const [only] = db.listUnconfirmedIngredients();
+  assert.throws(() => db.mergeIngredient(only!.id, only!.id), /itself/);
+  assert.throws(() => db.mergeIngredient(only!.id, 9999), /no ingredient/);
+  db.close();
+});
