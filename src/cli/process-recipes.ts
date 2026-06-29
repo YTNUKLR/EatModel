@@ -4,6 +4,7 @@ import crypto from "node:crypto";
 import { Db, type SaveRecipePageSummary } from "../db/db";
 import { selectRecipeParser } from "./select-recipe-parser";
 import { prepareImage } from "./prepare-image";
+import { processedName } from "./processed-name";
 import type { RecipePage } from "../shared/recipe-types";
 
 // Load .env (Node 22+) so ANTHROPIC_API_KEY etc. are available with no extra
@@ -12,6 +13,7 @@ if (fs.existsSync(".env")) process.loadEnvFile(".env");
 
 const INBOX = process.env.EATMODEL_RECIPE_INBOX ?? "recipes/inbox";
 const PROCESSED = process.env.EATMODEL_RECIPE_PROCESSED ?? "recipes/processed";
+const FAILED = process.env.EATMODEL_RECIPE_FAILED ?? "recipes/failed";
 const DB_PATH = process.env.EATMODEL_DB ?? "data/eatmodel.db";
 
 // Formats the parser reads directly, plus HEIC/HEIF which we convert first.
@@ -66,24 +68,37 @@ async function main(): Promise<void> {
 
   let ok = 0;
   let skipped = 0;
+  let failed = 0;
   for (const file of images) {
     const full = path.join(INBOX, file);
     let prepared: ReturnType<typeof prepareImage> | undefined;
     try {
       // Content-hash dedup: skip (and don't re-call the API) if already ingested.
       const hash = sha256(full);
+      const dest = processedName(hash, file); // hash-prefixed so same-named images don't clobber
       if (db.hasRecipe(hash)) {
         console.log(`↷ ${file}: already ingested — skipping\n`);
-        fs.renameSync(full, path.join(PROCESSED, file));
+        fs.renameSync(full, path.join(PROCESSED, dest));
         skipped++;
         continue;
       }
 
       prepared = prepareImage(full); // HEIC→temp JPEG; original is untouched
       const page = await parser.parse(prepared.path);
+
+      // No recipe found → quarantine, don't save. Saving a 0-recipe page would
+      // dedup the image as "done" and re-billing it would never re-extract it.
+      if (page.recipes.length === 0) {
+        fs.mkdirSync(FAILED, { recursive: true });
+        fs.renameSync(full, path.join(FAILED, dest));
+        console.warn(`⚠ ${file}: no recipe found — moved to ${FAILED}/ for review (not saved)\n`);
+        failed++;
+        continue;
+      }
+
       const summary = db.saveRecipePage(page, file, parser.name, hash);
       printPage(file, page, summary, prepared.converted);
-      fs.renameSync(full, path.join(PROCESSED, file)); // drain the inbox; keep the original
+      fs.renameSync(full, path.join(PROCESSED, dest)); // drain the inbox; keep the original
       ok++;
     } catch (err) {
       console.error(`✗ ${file}: ${(err as Error).message}\n`);
@@ -93,8 +108,14 @@ async function main(): Promise<void> {
   }
 
   const t = db.totals();
+  const extra = [
+    skipped ? `${skipped} skipped (duplicate)` : "",
+    failed ? `${failed} quarantined (no recipe)` : "",
+  ]
+    .filter(Boolean)
+    .join(", ");
   console.log(
-    `Done. ${ok} processed${skipped ? `, ${skipped} skipped (duplicate)` : ""}.  ` +
+    `Done. ${ok} processed${extra ? `, ${extra}` : ""}.  ` +
       `DB now holds ${t.recipes} recipe(s), ${t.ingredients} ingredient(s).`,
   );
   db.close();

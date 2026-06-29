@@ -154,7 +154,50 @@ export class Db {
     this.db = new Database(dbPath);
     this.db.pragma("journal_mode = WAL");
     this.db.pragma("foreign_keys = ON");
-    this.db.exec(DDL);
+    this.db.exec(DDL); // creates any missing tables; never alters existing ones
+    this.migrate(); // reconcile older dbs whose tables predate newer columns
+  }
+
+  private tableExists(table: string): boolean {
+    return (
+      this.db
+        .prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?")
+        .get(table) !== undefined
+    );
+  }
+
+  private columnExists(table: string, column: string): boolean {
+    // PRAGMA can't be parameterized; table names here are internal literals.
+    const cols = this.db.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[];
+    return cols.some((c) => c.name === column);
+  }
+
+  /**
+   * Discovery-phase migration (no migration tooling yet — ARCHITECTURE.md
+   * decision log). `CREATE TABLE IF NOT EXISTS` leaves pre-existing tables on
+   * their old shape, so we reconcile here:
+   *  - additive, recoverable changes → `ALTER TABLE ADD COLUMN` in place;
+   *  - structural changes that can't be backfilled → fail loud and tell the
+   *    user to `npm run db:reset` (a db created by an older EatModel).
+   */
+  private migrate(): void {
+    // A pre-"recipe page" recipes table has no ingest_id. ingest_id is a NOT NULL
+    // FK with no value to backfill onto existing rows — not additively fixable.
+    if (this.tableExists("recipes") && !this.columnExists("recipes", "ingest_id")) {
+      throw new Error(
+        "this database was created by an older EatModel schema and can't be auto-migrated " +
+          "(discovery phase has no migrations yet) — run `npm run db:reset` to recreate it.",
+      );
+    }
+
+    // Added with the ingestion-safety work; recoverable on old receipt tables.
+    // (ALTER can't add a column with UNIQUE, so add it plain + a UNIQUE index.)
+    if (this.tableExists("receipts") && !this.columnExists("receipts", "image_sha256")) {
+      this.db.exec("ALTER TABLE receipts ADD COLUMN image_sha256 TEXT");
+      this.db.exec(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_receipts_image_sha256 ON receipts(image_sha256)",
+      );
+    }
   }
 
   /**

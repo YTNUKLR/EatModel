@@ -2,10 +2,12 @@ node_modules/
 data/
 receipts/inbox/*
 receipts/processed/*
+receipts/failed/
 !receipts/inbox/.gitkeep
 !receipts/processed/.gitkeep
 recipes/inbox/*
 recipes/processed/*
+recipes/failed/
 !recipes/inbox/.gitkeep
 !recipes/processed/.gitkeep
 .env
