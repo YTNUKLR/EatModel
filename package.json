@@ -1,0 +1,28 @@
+{
+  "name": "eatmodel",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "description": "EatModel — discovery slice: receipt photo → OCR → SQLite price history",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "process": "tsx src/cli/process-receipts.ts",
+    "process:mock": "EATMODEL_PARSER=mock tsx src/cli/process-receipts.ts",
+    "test": "node --import tsx --test \"src/**/*.test.ts\"",
+    "check": "tsc --noEmit && npm test",
+    "db:reset": "rm -f data/eatmodel.db data/eatmodel.db-wal data/eatmodel.db-shm"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.107.0",
+    "better-sqlite3": "^12.11.1",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/node": "^26.0.1",
+    "tsx": "^4.22.4",
+    "typescript": "^6.0.3"
+  }
+}

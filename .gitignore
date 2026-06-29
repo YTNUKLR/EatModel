@@ -1,0 +1,8 @@
+node_modules/
+data/
+receipts/inbox/*
+receipts/processed/*
+!receipts/inbox/.gitkeep
+!receipts/processed/.gitkeep
+.env
+*.log
