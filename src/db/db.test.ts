@@ -2,6 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { Db } from "./db";
 import type { ParsedLineItem, ReceiptParseResult } from "../shared/types";
+import type { RecipeIngredientLine, RecipeParseResult } from "../shared/recipe-types";
 
 // Each test gets its own in-memory database, so they're fully isolated and
 // leave nothing on disk. Db's methods are synchronous (better-sqlite3).
@@ -24,6 +25,24 @@ function receipt(lines: ParsedLineItem[], store = "Test Mart"): ReceiptParseResu
   return { store, purchasedAt: "2026-06-20", total: null, currency: "USD", lines };
 }
 
+function ingredientLine(
+  ingredient: string,
+  fields: Partial<RecipeIngredientLine> = {},
+): RecipeIngredientLine {
+  return {
+    rawText: fields.rawText ?? ingredient,
+    ingredient,
+    quantity: fields.quantity ?? null,
+    unit: fields.unit ?? null,
+    prepNote: fields.prepNote ?? null,
+    optional: fields.optional ?? false,
+  };
+}
+
+function recipe(ingredients: RecipeIngredientLine[], title = "Test Recipe"): RecipeParseResult {
+  return { title, sourceNote: "Test Book p.1", servings: 4, ingredients };
+}
+
 test("persists a receipt and reports per-line outcomes", () => {
   const db = freshDb();
   const summary = db.saveReceipt(
@@ -41,7 +60,7 @@ test("persists a receipt and reports per-line outcomes", () => {
   assert.equal(summary.priceObservations, 2);
   assert.equal(summary.lines[0]?.confidence, "new");
 
-  assert.deepEqual(db.totals(), { receipts: 1, ingredients: 2, priceObservations: 2 });
+  assert.deepEqual(db.totals(), { receipts: 1, ingredients: 2, priceObservations: 2, recipes: 0 });
   db.close();
 });
 
@@ -125,5 +144,71 @@ test("records the line but no price observation when nothing is priced", () => {
   const totals = db.totals();
   assert.equal(totals.ingredients, 1); // ingredient still created
   assert.equal(totals.priceObservations, 0);
+  db.close();
+});
+
+// --- Recipes -------------------------------------------------------------
+
+test("persists a recipe and reports per-line outcomes", () => {
+  const db = freshDb();
+  const summary = db.saveRecipe(
+    recipe([
+      ingredientLine("Chicken thighs", { quantity: 1.5, unit: "lb" }),
+      ingredientLine("Garlic", { quantity: 2, unit: "clove", prepNote: "minced" }),
+      ingredientLine("Red pepper flakes", { optional: true }),
+    ]),
+    "r.jpg",
+    "mock",
+  );
+
+  assert.ok(summary.recipeId > 0);
+  assert.equal(summary.lines.length, 3);
+  assert.equal(summary.newIngredients, 3);
+  assert.equal(summary.lines[0]?.confidence, "new");
+  assert.equal(summary.lines[2]?.optional, true);
+
+  const totals = db.totals();
+  assert.equal(totals.recipes, 1);
+  assert.equal(totals.ingredients, 3);
+  assert.equal(totals.priceObservations, 0); // recipes never create price facts
+  db.close();
+});
+
+test("recipe ingredients resolve to the shared spine, not a parallel one", () => {
+  const db = freshDb();
+  // An ingredient first seen on a receipt...
+  db.saveReceipt(receipt([line("Chicken thighs", { unitPrice: 2.49 })]), "a.jpg", "mock");
+  // ...is matched (not duplicated) when it later appears in a recipe.
+  const r = db.saveRecipe(recipe([ingredientLine("Chicken thighs", { quantity: 1, unit: "lb" })]), "r.jpg", "mock");
+
+  assert.equal(r.lines[0]?.confidence, "alias");
+  assert.equal(r.newIngredients, 0);
+  assert.equal(db.totals().ingredients, 1); // one canonical ingredient across both sources
+  db.close();
+});
+
+test("recipe alias matching ignores case, spacing, and punctuation", () => {
+  const db = freshDb();
+  db.saveRecipe(recipe([ingredientLine("Garlic")]), "1.jpg", "mock");
+  const second = db.saveRecipe(recipe([ingredientLine("  GARLIC! ")]), "2.jpg", "mock");
+
+  assert.equal(second.lines[0]?.confidence, "alias");
+  assert.equal(db.totals().ingredients, 1);
+  db.close();
+});
+
+test("tracks ingested recipe image hashes for idempotency", () => {
+  const db = freshDb();
+  assert.equal(db.hasRecipe("rhash"), false);
+  db.saveRecipe(recipe([ingredientLine("Garlic")]), "r.jpg", "mock", "rhash");
+  assert.equal(db.hasRecipe("rhash"), true);
+  assert.equal(db.hasRecipe("other"), false);
+  db.close();
+});
+
+test("the unique recipe image hash backstops double ingestion", () => {
+  const db = freshDb();
+  db.saveRecipe(recipe([ingredientLine("Garlic")]), "r.jpg", "mock", "dup");
+  assert.throws(() => db.saveRecipe(recipe([ingredientLine("Garlic")]), "r.jpg", "mock", "dup"));
   db.close();
 });

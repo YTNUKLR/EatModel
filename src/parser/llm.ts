@@ -1,18 +1,8 @@
-import fs from "node:fs";
-import path from "node:path";
 import Anthropic from "@anthropic-ai/sdk";
 import { zodOutputFormat } from "@anthropic-ai/sdk/helpers/zod";
 import { ReceiptParseResult } from "../shared/types";
+import { imageBlock } from "./image";
 import type { ReceiptParser } from "./types";
-
-/** Claude vision accepts these; iPhone HEIC must be converted first. */
-const MEDIA_TYPES: Record<string, "image/jpeg" | "image/png" | "image/gif" | "image/webp"> = {
-  ".jpg": "image/jpeg",
-  ".jpeg": "image/jpeg",
-  ".png": "image/png",
-  ".gif": "image/gif",
-  ".webp": "image/webp",
-};
 
 const PROMPT = `You are reading a photo of a grocery store receipt. Extract every purchased product line.
 
@@ -43,16 +33,6 @@ export class LLMReceiptParser implements ReceiptParser {
   }
 
   async parse(imagePath: string): Promise<ReceiptParseResult> {
-    const ext = path.extname(imagePath).toLowerCase();
-    const mediaType = MEDIA_TYPES[ext];
-    if (!mediaType) {
-      throw new Error(
-        `unsupported image type "${ext}" (use jpg/png/gif/webp; convert iPhone HEIC to JPEG)`,
-      );
-    }
-
-    const data = fs.readFileSync(imagePath).toString("base64");
-
     // messages.parse + zodOutputFormat constrains the response to our schema and
     // returns it already validated — no hand-parsing of model text.
     const res = await this.client.messages.parse({
@@ -61,10 +41,7 @@ export class LLMReceiptParser implements ReceiptParser {
       messages: [
         {
           role: "user",
-          content: [
-            { type: "image", source: { type: "base64", media_type: mediaType, data } },
-            { type: "text", text: PROMPT },
-          ],
+          content: [imageBlock(imagePath), { type: "text", text: PROMPT }],
         },
       ],
       output_config: { format: zodOutputFormat(ReceiptParseResult) },

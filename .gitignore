@@ -4,5 +4,9 @@ receipts/inbox/*
 receipts/processed/*
 !receipts/inbox/.gitkeep
 !receipts/processed/.gitkeep
+recipes/inbox/*
+recipes/processed/*
+!recipes/inbox/.gitkeep
+!recipes/processed/.gitkeep
 .env
 *.log

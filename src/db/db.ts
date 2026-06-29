@@ -4,6 +4,7 @@ import Database from "better-sqlite3";
 import { normalizeName } from "../shared/units";
 import { deriveUnitPrice } from "../shared/pricing";
 import type { ReceiptParseResult } from "../shared/types";
+import type { RecipeParseResult } from "../shared/recipe-types";
 
 /**
  * The "ingredient spine" plus receipt + price tables, on SQLite. This is the
@@ -68,6 +69,33 @@ CREATE TABLE IF NOT EXISTS price_observations (
   currency        TEXT,
   source_line_id  INTEGER REFERENCES receipt_line_items(id)
 );
+
+CREATE TABLE IF NOT EXISTS recipes (
+  id             INTEGER PRIMARY KEY AUTOINCREMENT,
+  title          TEXT,
+  source_note    TEXT,
+  servings       REAL,
+  image_filename TEXT,
+  image_sha256   TEXT UNIQUE,
+  parser         TEXT,
+  raw_json       TEXT,
+  parsed_at      TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- A recipe line resolves to the same canonical ingredient as receipts (shared
+-- spine), but carries prep/optional and no price (separate envelope) — §5.4.
+CREATE TABLE IF NOT EXISTS recipe_ingredients (
+  id               INTEGER PRIMARY KEY AUTOINCREMENT,
+  recipe_id        INTEGER NOT NULL REFERENCES recipes(id),
+  raw_text         TEXT,
+  ingredient_text  TEXT,
+  quantity         REAL,
+  unit             TEXT,
+  prep_note        TEXT,
+  optional         INTEGER,
+  ingredient_id    INTEGER REFERENCES ingredients(id),
+  match_confidence TEXT
+);
 `;
 
 export type MatchConfidence = "alias" | "new";
@@ -88,6 +116,19 @@ export interface SaveSummary {
   priceObservations: number;
 }
 
+export interface RecipeLineOutcome {
+  ingredient: string;
+  ingredientId: number;
+  confidence: MatchConfidence;
+  optional: boolean;
+}
+
+export interface SaveRecipeSummary {
+  recipeId: number;
+  lines: RecipeLineOutcome[];
+  newIngredients: number;
+}
+
 export class Db {
   private readonly db: Database.Database;
 
@@ -105,7 +146,10 @@ export class Db {
    * ("new") so the catalog and price history accrue automatically. Every match
    * therefore teaches the system a new alias — the matcher gets smarter over time.
    */
-  private matchIngredient(description: string): { ingredientId: number; confidence: MatchConfidence } {
+  private matchIngredient(
+    description: string,
+    source: "receipt" | "recipe",
+  ): { ingredientId: number; confidence: MatchConfidence } {
     const normalized = normalizeName(description);
     const existing = this.db
       .prepare("SELECT ingredient_id AS id FROM ingredient_aliases WHERE normalized = ?")
@@ -118,9 +162,9 @@ export class Db {
     const ingredientId = Number(ing.lastInsertRowid);
     this.db
       .prepare(
-        "INSERT INTO ingredient_aliases (ingredient_id, alias_text, normalized, source) VALUES (?, ?, ?, 'receipt')",
+        "INSERT INTO ingredient_aliases (ingredient_id, alias_text, normalized, source) VALUES (?, ?, ?, ?)",
       )
-      .run(ingredientId, description.trim(), normalized);
+      .run(ingredientId, description.trim(), normalized, source);
     return { ingredientId, confidence: "new" };
   }
 
@@ -173,7 +217,7 @@ export class Db {
       let priceObservations = 0;
 
       for (const line of parsed.lines) {
-        const { ingredientId, confidence } = this.matchIngredient(line.description);
+        const { ingredientId, confidence } = this.matchIngredient(line.description, "receipt");
         if (confidence === "new") newIngredients++;
 
         const lineId = Number(
@@ -230,13 +274,99 @@ export class Db {
     return run();
   }
 
+  /** True if a recipe with this image content hash has already been ingested. */
+  hasRecipe(imageSha256: string): boolean {
+    return (
+      this.db.prepare("SELECT 1 FROM recipes WHERE image_sha256 = ? LIMIT 1").get(imageSha256) !==
+      undefined
+    );
+  }
+
+  /**
+   * Persist a parsed recipe: the recipe row plus each ingredient line, matched
+   * to a canonical ingredient on the shared spine (source='recipe'). One
+   * transaction so a partial recipe never lands in the db. No price
+   * observations — recipes carry no prices (§5.4).
+   *
+   * `imageSha256` is the content hash of the source image; the UNIQUE column is
+   * a backstop against double ingestion (the CLI also checks `hasRecipe` first).
+   */
+  saveRecipe(
+    parsed: RecipeParseResult,
+    imageFilename: string,
+    parser: string,
+    imageSha256: string | null = null,
+  ): SaveRecipeSummary {
+    const run = this.db.transaction((): SaveRecipeSummary => {
+      const recipeId = Number(
+        this.db
+          .prepare(
+            `INSERT INTO recipes (title, source_note, servings, image_filename, image_sha256, parser, raw_json)
+             VALUES (?, ?, ?, ?, ?, ?, ?)`,
+          )
+          .run(
+            parsed.title,
+            parsed.sourceNote,
+            parsed.servings,
+            imageFilename,
+            imageSha256,
+            parser,
+            JSON.stringify(parsed),
+          ).lastInsertRowid,
+      );
+
+      const lines: RecipeLineOutcome[] = [];
+      let newIngredients = 0;
+
+      for (const line of parsed.ingredients) {
+        const { ingredientId, confidence } = this.matchIngredient(line.ingredient, "recipe");
+        if (confidence === "new") newIngredients++;
+
+        this.db
+          .prepare(
+            `INSERT INTO recipe_ingredients
+               (recipe_id, raw_text, ingredient_text, quantity, unit, prep_note, optional, ingredient_id, match_confidence)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          )
+          .run(
+            recipeId,
+            line.rawText,
+            line.ingredient,
+            line.quantity,
+            line.unit,
+            line.prepNote,
+            line.optional ? 1 : 0,
+            ingredientId,
+            confidence,
+          );
+
+        lines.push({
+          ingredient: line.ingredient,
+          ingredientId,
+          confidence,
+          optional: line.optional,
+        });
+      }
+
+      return { recipeId, lines, newIngredients };
+    });
+
+    return run();
+  }
+
   /** Quick counts for the end-of-run summary. */
-  totals(): { ingredients: number; receipts: number; priceObservations: number } {
+  totals(): {
+    ingredients: number;
+    receipts: number;
+    priceObservations: number;
+    recipes: number;
+  } {
     const one = (sql: string) => (this.db.prepare(sql).get() as { n: number }).n;
     return {
       ingredients: one("SELECT COUNT(*) AS n FROM ingredients"),
       receipts: one("SELECT COUNT(*) AS n FROM receipts"),
       priceObservations: one("SELECT COUNT(*) AS n FROM price_observations"),
+      recipes: one("SELECT COUNT(*) AS n FROM recipes"),
     };
   }
 

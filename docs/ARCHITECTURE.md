@@ -276,6 +276,43 @@ RecipeIngredient (qty,unit) ─▶ convert to grams ─▶ × nutrition_per_100g
 Nutrition reference data: seed from a public source (e.g. USDA FoodData Central) for common items;
 allow manual override per ingredient. Accuracy improves incrementally; never block the app on it.
 
+### 5.4 Recipe capture (discovery slice)
+
+The symmetric twin of receipt capture: photograph a recipe (often a page from a cookbook) into a
+synced *recipe* inbox, then batch-process it from the laptop. Same skeleton as §5.1 — synced-folder
+ingest, vision-LLM parser behind an interface, content-hash dedup, repository write, move-to-processed.
+
+```
+Phone camera ─▶ recipe inbox (synced folder) ─▶ RecipeParser (vision LLM) ─▶ structured recipe
+   ─▶ ingredient matching (alias → create), source='recipe'
+   ─▶ write Recipe + RecipeIngredient rows
+```
+
+**Why this slice is worth building now:** it's the first thing that feeds the ingredient spine from
+the *recipe* side. Until now every canonical ingredient was born from a receipt line. Recipes write
+to the **same** `ingredients` table, which is the real test of the spine — and which exposes how far
+the exact-alias matcher is from converging recipe phrasing (`"boneless skinless chicken thighs"`)
+with receipt phrasing (`"GV CHKN THGH"`). That gap is discovery output, not a regression (§12).
+
+**Two design decisions specific to recipes:**
+
+- **Shared spine, separate envelope.** Recipe lines resolve to the *same* canonical `ingredients` /
+  `ingredient_aliases` as receipts (the spine is the whole point). But a recipe line is shaped
+  differently from a receipt line — it has a `prep_note` ("diced") and an `optional` flag, and it has
+  **no price**; a receipt line has price and no prep. So we deliberately do **not** force them through
+  one `ParsedLineItem` type. They share ingredient resolution and split on everything else: a separate
+  `RecipeParseResult` schema and separate `recipe` / `recipe_ingredients` tables. Premature unification
+  here would couple two things that are only half-alike.
+- **Ingredients-list-first (v1 scope).** The parser captures `title`, `source_note` (book / page),
+  `servings`, and the **ingredient list** — not the step-by-step instructions. The ingredient list is
+  what connects to the spine, grocery lists, and price/nutrition; steps are inert storage until there's
+  a cooking UI. Crucially this loses nothing: as with receipts we keep the original image in
+  `processed/` and store `raw_json`, so steps (or richer fields) can be re-parsed later without
+  re-photographing. Adding a `steps` field is an additive schema change, not a rewrite.
+
+The same seams persist into the real app: the synced folder → an upload endpoint, the CLI → a worker,
+the `RecipeParser` and repository interfaces unchanged.
+
 ---
 
 ## 6. Nutrition data model
@@ -392,6 +429,7 @@ Each phase should be independently useful. Don't build all six modules at once.
 - **2026-06-29** — Adopted **engineering conventions** (see `docs/CONVENTIONS.md`): green-`main` + feature branches, TDD for the deterministic core via `node:test`, evals (not unit tests) for the LLM parser, dependencies point inward. Pure price-derivation logic extracted to `shared/pricing.ts` and tested.
 - **2026-06-29** — **Ingestion safety** (from a code review): `process-receipts` loads `.env` and the parser selection **fails loud** without a key (mock only via `process:mock`, never a silent fallback); **content-hash dedup** (UNIQUE `image_sha256` + a pre-parse `hasReceipt` check) makes re-runs idempotent and avoids re-billing the API on duplicates.
 - **2026-06-29** — Stopped **fabricating** price-observation date/unit — a missing purchase date or unit is stored as `null`, not "today"/"each" (per `CONVENTIONS.md §5`).
+- **2026-06-29** — **Recipe ingestion** added as the second discovery slice, mirroring receipts (synced inbox + batch CLI + vision LLM behind a `RecipeParser` interface + content-hash dedup). **Shared spine, separate envelope**: recipe lines resolve to the same canonical `ingredients`/`ingredient_aliases` but get their own `RecipeParseResult` schema and `recipe`/`recipe_ingredients` tables (recipe lines carry `prep_note`/`optional` and no price; receipt lines carry price and no prep — no shared `ParsedLineItem`). Scope is **ingredients-list-first**: capture title/source/servings/ingredients, not instructions; the original image + `raw_json` are kept so steps can be re-parsed later (additive, not a rewrite).
 
 ---
 
@@ -413,6 +451,14 @@ Deliberate simplifications in the first slice — recorded so they aren't mistak
   On non-macOS platforms HEIC fails per-file with a clear message — convert manually or capture JPEG.
 - **No reporting yet.** Data accumulates in SQLite but there's no trend/price-history view — that's the
   next build (§7 Phase 3).
+- **Recipe lines fragment the spine, and across sources too.** Recipe ingredients use the same
+  exact-alias-or-create matcher (§5.4), so recipe phrasing rarely converges with receipt phrasing yet
+  (`"boneless skinless chicken thighs"` ≠ `"GV CHKN THGH"`). Until fuzzy/embedding matching + a review
+  queue (#3/#5, §13; full matching in §7 Phase 3), the spine over-fragments — expected, and exactly the
+  signal this slice exists to surface.
+- **Recipe steps are not captured (ingredients-list-first).** v1 extracts title/source/servings/
+  ingredients only. The original image and `raw_json` are retained, so instructions can be re-parsed
+  later without re-photographing.
 
 ---
 
