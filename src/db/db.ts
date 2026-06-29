@@ -4,7 +4,7 @@ import Database from "better-sqlite3";
 import { normalizeName } from "../shared/units";
 import { deriveUnitPrice } from "../shared/pricing";
 import type { ReceiptParseResult } from "../shared/types";
-import type { RecipeParseResult } from "../shared/recipe-types";
+import type { RecipeParseResult, RecipePage } from "../shared/recipe-types";
 
 /**
  * The "ingredient spine" plus receipt + price tables, on SQLite. This is the
@@ -70,16 +70,25 @@ CREATE TABLE IF NOT EXISTS price_observations (
   source_line_id  INTEGER REFERENCES receipt_line_items(id)
 );
 
-CREATE TABLE IF NOT EXISTS recipes (
+-- One photographed page = one ingest. The image content hash lives here (UNIQUE),
+-- so re-ingesting the same photo is blocked even though a page yields many recipes.
+CREATE TABLE IF NOT EXISTS recipe_ingests (
   id             INTEGER PRIMARY KEY AUTOINCREMENT,
-  title          TEXT,
-  source_note    TEXT,
-  servings       REAL,
   image_filename TEXT,
   image_sha256   TEXT UNIQUE,
   parser         TEXT,
+  recipe_count   INTEGER,
   raw_json       TEXT,
   parsed_at      TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS recipes (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  ingest_id   INTEGER NOT NULL REFERENCES recipe_ingests(id),
+  title       TEXT,
+  source_note TEXT,
+  servings    REAL,
+  created_at  TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
 -- A recipe line resolves to the same canonical ingredient as receipts (shared
@@ -125,7 +134,15 @@ export interface RecipeLineOutcome {
 
 export interface SaveRecipeSummary {
   recipeId: number;
+  title: string | null;
   lines: RecipeLineOutcome[];
+  newIngredients: number;
+}
+
+export interface SaveRecipePageSummary {
+  ingestId: number;
+  recipes: SaveRecipeSummary[];
+  /** New canonical ingredients minted across the whole page. */
   newIngredients: number;
 }
 
@@ -274,22 +291,100 @@ export class Db {
     return run();
   }
 
-  /** True if a recipe with this image content hash has already been ingested. */
+  /** True if a page with this image content hash has already been ingested. */
   hasRecipe(imageSha256: string): boolean {
     return (
-      this.db.prepare("SELECT 1 FROM recipes WHERE image_sha256 = ? LIMIT 1").get(imageSha256) !==
-      undefined
+      this.db
+        .prepare("SELECT 1 FROM recipe_ingests WHERE image_sha256 = ? LIMIT 1")
+        .get(imageSha256) !== undefined
     );
   }
 
   /**
-   * Persist a parsed recipe: the recipe row plus each ingredient line, matched
-   * to a canonical ingredient on the shared spine (source='recipe'). One
-   * transaction so a partial recipe never lands in the db. No price
-   * observations — recipes carry no prices (§5.4).
+   * Persist every recipe read off one image. Writes one `recipe_ingests` row
+   * (the image — content hash lives here, UNIQUE) and one `recipes` row per
+   * recipe, each ingredient matched to the shared spine (source='recipe'). All
+   * in one transaction, so a partial page never lands. No price observations —
+   * recipes carry no prices (§5.4).
    *
-   * `imageSha256` is the content hash of the source image; the UNIQUE column is
-   * a backstop against double ingestion (the CLI also checks `hasRecipe` first).
+   * The UNIQUE `image_sha256` on the ingest backstops double ingestion (the CLI
+   * also checks `hasRecipe` first); a page with N recipes still hashes once.
+   */
+  saveRecipePage(
+    page: RecipePage,
+    imageFilename: string,
+    parser: string,
+    imageSha256: string | null = null,
+  ): SaveRecipePageSummary {
+    const run = this.db.transaction((): SaveRecipePageSummary => {
+      const ingestId = Number(
+        this.db
+          .prepare(
+            `INSERT INTO recipe_ingests (image_filename, image_sha256, parser, recipe_count, raw_json)
+             VALUES (?, ?, ?, ?, ?)`,
+          )
+          .run(imageFilename, imageSha256, parser, page.recipes.length, JSON.stringify(page))
+          .lastInsertRowid,
+      );
+
+      const recipes: SaveRecipeSummary[] = [];
+      let pageNewIngredients = 0;
+
+      for (const recipe of page.recipes) {
+        const recipeId = Number(
+          this.db
+            .prepare("INSERT INTO recipes (ingest_id, title, source_note, servings) VALUES (?, ?, ?, ?)")
+            .run(ingestId, recipe.title, recipe.sourceNote, recipe.servings).lastInsertRowid,
+        );
+
+        const lines: RecipeLineOutcome[] = [];
+        let newIngredients = 0;
+
+        for (const line of recipe.ingredients) {
+          const { ingredientId, confidence } = this.matchIngredient(line.ingredient, "recipe");
+          if (confidence === "new") {
+            newIngredients++;
+            pageNewIngredients++;
+          }
+
+          this.db
+            .prepare(
+              `INSERT INTO recipe_ingredients
+                 (recipe_id, raw_text, ingredient_text, quantity, unit, prep_note, optional, ingredient_id, match_confidence)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            )
+            .run(
+              recipeId,
+              line.rawText,
+              line.ingredient,
+              line.quantity,
+              line.unit,
+              line.prepNote,
+              line.optional ? 1 : 0,
+              ingredientId,
+              confidence,
+            );
+
+          lines.push({
+            ingredient: line.ingredient,
+            ingredientId,
+            confidence,
+            optional: line.optional,
+          });
+        }
+
+        recipes.push({ recipeId, title: recipe.title, lines, newIngredients });
+      }
+
+      return { ingestId, recipes, newIngredients: pageNewIngredients };
+    });
+
+    return run();
+  }
+
+  /**
+   * Convenience wrapper for a single recipe — saves it as a one-recipe page and
+   * returns that recipe's summary. Keeps single-recipe callers/tests simple.
    */
   saveRecipe(
     parsed: RecipeParseResult,
@@ -297,61 +392,10 @@ export class Db {
     parser: string,
     imageSha256: string | null = null,
   ): SaveRecipeSummary {
-    const run = this.db.transaction((): SaveRecipeSummary => {
-      const recipeId = Number(
-        this.db
-          .prepare(
-            `INSERT INTO recipes (title, source_note, servings, image_filename, image_sha256, parser, raw_json)
-             VALUES (?, ?, ?, ?, ?, ?, ?)`,
-          )
-          .run(
-            parsed.title,
-            parsed.sourceNote,
-            parsed.servings,
-            imageFilename,
-            imageSha256,
-            parser,
-            JSON.stringify(parsed),
-          ).lastInsertRowid,
-      );
-
-      const lines: RecipeLineOutcome[] = [];
-      let newIngredients = 0;
-
-      for (const line of parsed.ingredients) {
-        const { ingredientId, confidence } = this.matchIngredient(line.ingredient, "recipe");
-        if (confidence === "new") newIngredients++;
-
-        this.db
-          .prepare(
-            `INSERT INTO recipe_ingredients
-               (recipe_id, raw_text, ingredient_text, quantity, unit, prep_note, optional, ingredient_id, match_confidence)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-          )
-          .run(
-            recipeId,
-            line.rawText,
-            line.ingredient,
-            line.quantity,
-            line.unit,
-            line.prepNote,
-            line.optional ? 1 : 0,
-            ingredientId,
-            confidence,
-          );
-
-        lines.push({
-          ingredient: line.ingredient,
-          ingredientId,
-          confidence,
-          optional: line.optional,
-        });
-      }
-
-      return { recipeId, lines, newIngredients };
-    });
-
-    return run();
+    const page = this.saveRecipePage({ recipes: [parsed] }, imageFilename, parser, imageSha256);
+    const only = page.recipes[0];
+    if (!only) throw new Error("saveRecipe: page produced no recipe");
+    return only;
   }
 
   /** Quick counts for the end-of-run summary. */

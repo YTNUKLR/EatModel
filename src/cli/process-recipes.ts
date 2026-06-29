@@ -1,10 +1,10 @@
 import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
-import { Db, type SaveRecipeSummary } from "../db/db";
+import { Db, type SaveRecipePageSummary } from "../db/db";
 import { selectRecipeParser } from "./select-recipe-parser";
 import { prepareImage } from "./prepare-image";
-import type { RecipeParseResult } from "../shared/recipe-types";
+import type { RecipePage } from "../shared/recipe-types";
 
 // Load .env (Node 22+) so ANTHROPIC_API_KEY etc. are available with no extra
 // tooling. Without this, a filled-in .env would be ignored entirely.
@@ -23,26 +23,28 @@ function sha256(file: string): string {
   return crypto.createHash("sha256").update(fs.readFileSync(file)).digest("hex");
 }
 
-function printRecipe(
+function printPage(
   file: string,
-  parsed: RecipeParseResult,
-  summary: SaveRecipeSummary,
+  page: RecipePage,
+  summary: SaveRecipePageSummary,
   converted: boolean,
 ): void {
-  const title = parsed.title ?? "(untitled recipe)";
-  const src = parsed.sourceNote ? ` · ${parsed.sourceNote}` : "";
-  const serves = parsed.servings != null ? ` · serves ${parsed.servings}` : "";
   const note = converted ? "  [converted HEIC→JPEG]" : "";
-  console.log(`✓ ${file}${note}  →  ${title}${src}${serves}`);
-  for (const line of summary.lines) {
-    const tag = line.confidence === "new" ? "＋new" : " alias";
-    const opt = line.optional ? "  (optional)" : "";
-    console.log(`    [${tag}] ${line.ingredient}${opt}`);
-  }
-  console.log(
-    `    saved recipe #${summary.recipeId}: ${summary.lines.length} ingredient(s), ` +
-      `${summary.newIngredients} new ingredient(s)\n`,
-  );
+  const n = summary.recipes.length;
+  console.log(`✓ ${file}${note}  →  ${n} recipe(s)`);
+  summary.recipes.forEach((r, i) => {
+    const parsed = page.recipes[i];
+    const title = r.title ?? "(untitled recipe)";
+    const src = parsed?.sourceNote ? ` · ${parsed.sourceNote}` : "";
+    const serves = parsed?.servings != null ? ` · serves ${parsed.servings}` : "";
+    console.log(`    • ${title}${src}${serves}  —  recipe #${r.recipeId}`);
+    for (const line of r.lines) {
+      const tag = line.confidence === "new" ? "＋new" : " alias";
+      const opt = line.optional ? "  (optional)" : "";
+      console.log(`        [${tag}] ${line.ingredient}${opt}`);
+    }
+  });
+  console.log(`    ${summary.newIngredients} new ingredient(s) across the page\n`);
 }
 
 async function main(): Promise<void> {
@@ -78,9 +80,9 @@ async function main(): Promise<void> {
       }
 
       prepared = prepareImage(full); // HEIC→temp JPEG; original is untouched
-      const parsed = await parser.parse(prepared.path);
-      const summary = db.saveRecipe(parsed, file, parser.name, hash);
-      printRecipe(file, parsed, summary, prepared.converted);
+      const page = await parser.parse(prepared.path);
+      const summary = db.saveRecipePage(page, file, parser.name, hash);
+      printPage(file, page, summary, prepared.converted);
       fs.renameSync(full, path.join(PROCESSED, file)); // drain the inbox; keep the original
       ok++;
     } catch (err) {

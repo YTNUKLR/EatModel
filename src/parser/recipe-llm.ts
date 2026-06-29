@@ -1,12 +1,12 @@
 import Anthropic from "@anthropic-ai/sdk";
 import { zodOutputFormat } from "@anthropic-ai/sdk/helpers/zod";
-import { RecipeParseResult } from "../shared/recipe-types";
+import { RecipePage } from "../shared/recipe-types";
 import { imageBlock } from "./image";
 import type { RecipeParser } from "./recipe-types";
 
-const PROMPT = `You are reading a photo of a recipe, often a page from a cookbook. Extract the recipe's identity and its ingredient list ONLY — do not transcribe the step-by-step instructions.
+const PROMPT = `You are reading a photo of a cookbook page or recipe card. Extract EVERY distinct recipe shown on the image — a page often has more than one (e.g. two recipes side by side). Capture each recipe's identity and its ingredient list ONLY — do not transcribe the step-by-step instructions.
 
-Return:
+Return a "recipes" array with one entry per distinct recipe. For each recipe:
 - title: the recipe title if visible, else null
 - sourceNote: where it's from (book title + page number, website, etc.) if visible, else null
 - servings: the number of servings/yield as a number if stated, else null
@@ -19,7 +19,7 @@ For each ingredient line:
 - prepNote: preparation instructions on the line ("minced", "to taste", "softened"), else null
 - optional: true if the line marks the ingredient as optional ("optional", "if desired"), else false
 
-Only include actual ingredients. Ignore the method/instructions, headnotes, equipment lists, and nutrition panels.`;
+Only include actual ingredients. Ignore the method/instructions, headnotes, equipment lists, and nutrition panels. If only one recipe is shown, return a single-element "recipes" array.`;
 
 export class LLMRecipeParser implements RecipeParser {
   readonly name = "llm";
@@ -32,7 +32,7 @@ export class LLMRecipeParser implements RecipeParser {
     this.model = opts.model ?? "claude-opus-4-8";
   }
 
-  async parse(imagePath: string): Promise<RecipeParseResult> {
+  async parse(imagePath: string): Promise<RecipePage> {
     const res = await this.client.messages.parse({
       model: this.model,
       max_tokens: 4096,
@@ -42,7 +42,7 @@ export class LLMRecipeParser implements RecipeParser {
           content: [imageBlock(imagePath), { type: "text", text: PROMPT }],
         },
       ],
-      output_config: { format: zodOutputFormat(RecipeParseResult) },
+      output_config: { format: zodOutputFormat(RecipePage) },
     });
 
     if (!res.parsed_output) {

@@ -60,8 +60,9 @@ npm run recipes:mock   # canned recipe, no key/cost — verify the plumbing
 ```
 
 v1 captures the **ingredient list** (title, source, servings, ingredients), not the step-by-step
-instructions — the original image is kept so steps can be re-parsed later. Recipe ingredients resolve
-to the *same* canonical ingredients as receipts.
+instructions — the original image is kept so steps can be re-parsed later. A single photo can hold
+**multiple recipes** (e.g. a cookbook spread); each is saved separately under one image "ingest".
+Recipe ingredients resolve to the *same* canonical ingredients as receipts.
 
 Processed images move to the matching `processed/` folder; data lands in `data/eatmodel.db`. Re-run
 anytime — each inbox is drained per pass, and re-ingesting the same photo is a no-op (content-hash

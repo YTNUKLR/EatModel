@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { Db } from "./db";
 import type { ParsedLineItem, ReceiptParseResult } from "../shared/types";
-import type { RecipeIngredientLine, RecipeParseResult } from "../shared/recipe-types";
+import type { RecipeIngredientLine, RecipeParseResult, RecipePage } from "../shared/recipe-types";
 
 // Each test gets its own in-memory database, so they're fully isolated and
 // leave nothing on disk. Db's methods are synchronous (better-sqlite3).
@@ -41,6 +41,10 @@ function ingredientLine(
 
 function recipe(ingredients: RecipeIngredientLine[], title = "Test Recipe"): RecipeParseResult {
   return { title, sourceNote: "Test Book p.1", servings: 4, ingredients };
+}
+
+function page(recipes: RecipeParseResult[]): RecipePage {
+  return { recipes };
 }
 
 test("persists a receipt and reports per-line outcomes", () => {
@@ -210,5 +214,41 @@ test("the unique recipe image hash backstops double ingestion", () => {
   const db = freshDb();
   db.saveRecipe(recipe([ingredientLine("Garlic")]), "r.jpg", "mock", "dup");
   assert.throws(() => db.saveRecipe(recipe([ingredientLine("Garlic")]), "r.jpg", "mock", "dup"));
+  db.close();
+});
+
+test("one image yields multiple recipes under a single ingest", () => {
+  const db = freshDb();
+  const summary = db.saveRecipePage(
+    page([
+      recipe([ingredientLine("Chicken thighs"), ingredientLine("Garlic")], "Chicken dish"),
+      recipe([ingredientLine("Brown rice"), ingredientLine("Garlic")], "Rice dish"),
+    ]),
+    "spread.jpg",
+    "mock",
+    "pagehash",
+  );
+
+  assert.equal(summary.recipes.length, 2);
+  assert.equal(summary.recipes[0]?.title, "Chicken dish");
+  assert.equal(summary.recipes[1]?.title, "Rice dish");
+
+  const totals = db.totals();
+  assert.equal(totals.recipes, 2); // two recipe rows...
+  // ...but Garlic is shared across both recipes → 3 canonical ingredients, not 4.
+  assert.equal(totals.ingredients, 3);
+  assert.equal(summary.newIngredients, 3); // unique new ingredients across the page
+  // The second recipe's Garlic resolved to the first's alias.
+  assert.equal(summary.recipes[1]?.lines.find((l) => l.ingredient === "Garlic")?.confidence, "alias");
+  db.close();
+});
+
+test("a whole multi-recipe page dedups on the one image hash", () => {
+  const db = freshDb();
+  const spread = page([recipe([ingredientLine("Garlic")]), recipe([ingredientLine("Basil")])]);
+  assert.equal(db.hasRecipe("h"), false);
+  db.saveRecipePage(spread, "spread.jpg", "mock", "h");
+  assert.equal(db.hasRecipe("h"), true); // the image (not each recipe) is the dedup unit
+  assert.throws(() => db.saveRecipePage(spread, "spread.jpg", "mock", "h"));
   db.close();
 });

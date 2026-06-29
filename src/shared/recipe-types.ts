@@ -40,3 +40,13 @@ export const RecipeParseResult = z.object({
   ingredients: z.array(RecipeIngredientLine),
 });
 export type RecipeParseResult = z.infer<typeof RecipeParseResult>;
+
+/**
+ * One photographed page can hold several recipes (cookbook spreads routinely do).
+ * The parser returns *all* recipes it can read on the image; the image itself is
+ * the dedup unit (one photo → one content hash → one ingest → many recipes).
+ */
+export const RecipePage = z.object({
+  recipes: z.array(RecipeParseResult),
+});
+export type RecipePage = z.infer<typeof RecipePage>;

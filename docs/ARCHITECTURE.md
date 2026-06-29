@@ -283,10 +283,16 @@ synced *recipe* inbox, then batch-process it from the laptop. Same skeleton as �
 ingest, vision-LLM parser behind an interface, content-hash dedup, repository write, move-to-processed.
 
 ```
-Phone camera ─▶ recipe inbox (synced folder) ─▶ RecipeParser (vision LLM) ─▶ structured recipe
+Phone camera ─▶ recipe inbox (synced folder) ─▶ RecipeParser (vision LLM) ─▶ structured recipes (1+ per page)
    ─▶ ingredient matching (alias → create), source='recipe'
-   ─▶ write Recipe + RecipeIngredient rows
+   ─▶ write RecipeIngest (the image) + Recipe + RecipeIngredient rows
 ```
+
+**One image, many recipes.** A photographed cookbook page routinely shows more than one recipe
+(the first real test image had two side by side — "Minted Pineapple" and "Quick Tomato Mold"). So the
+parser returns a `RecipePage` = a list of recipes, and persistence splits into a `recipe_ingests` row
+(the image — the content hash + dedup live here, one per photo) and one `recipes` row per recipe on it.
+This keeps the idempotency backstop (UNIQUE image hash) while letting a page fan out to N recipes.
 
 **Why this slice is worth building now:** it's the first thing that feeds the ingredient spine from
 the *recipe* side. Until now every canonical ingredient was born from a receipt line. Recipes write
@@ -430,6 +436,7 @@ Each phase should be independently useful. Don't build all six modules at once.
 - **2026-06-29** — **Ingestion safety** (from a code review): `process-receipts` loads `.env` and the parser selection **fails loud** without a key (mock only via `process:mock`, never a silent fallback); **content-hash dedup** (UNIQUE `image_sha256` + a pre-parse `hasReceipt` check) makes re-runs idempotent and avoids re-billing the API on duplicates.
 - **2026-06-29** — Stopped **fabricating** price-observation date/unit — a missing purchase date or unit is stored as `null`, not "today"/"each" (per `CONVENTIONS.md §5`).
 - **2026-06-29** — **Recipe ingestion** added as the second discovery slice, mirroring receipts (synced inbox + batch CLI + vision LLM behind a `RecipeParser` interface + content-hash dedup). **Shared spine, separate envelope**: recipe lines resolve to the same canonical `ingredients`/`ingredient_aliases` but get their own `RecipeParseResult` schema and `recipe`/`recipe_ingredients` tables (recipe lines carry `prep_note`/`optional` and no price; receipt lines carry price and no prep — no shared `ParsedLineItem`). Scope is **ingredients-list-first**: capture title/source/servings/ingredients, not instructions; the original image + `raw_json` are kept so steps can be re-parsed later (additive, not a rewrite).
+- **2026-06-29** — **One image → many recipes** (found on the first real cookbook photo, which had two recipes side by side): `RecipeParser` returns a `RecipePage` (list of recipes), and persistence splits into `recipe_ingests` (the image — UNIQUE content hash / dedup lives here) → many `recipes`. Preserves the idempotency backstop while a page fans out to N recipes. Validated end-to-end: both recipes landed, and an ingredient shared across the two ("salt") resolved to one canonical entry.
 
 ---
 
