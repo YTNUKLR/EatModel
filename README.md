@@ -44,9 +44,10 @@ npm run process
 Processed images move to `receipts/processed/`; data lands in `data/eatmodel.db`. Re-run anytime —
 the inbox is drained each pass. `npm run db:reset` clears the database.
 
-> iPhone photos are often HEIC, which Claude vision doesn't accept. Either set
-> **Settings ▸ Camera ▸ Formats ▸ "Most Compatible"** (saves JPEG), or convert before processing.
-> The CLI warns and skips HEIC files rather than failing.
+> iPhone photos are often HEIC, which Claude vision doesn't accept directly. On **macOS** the CLI
+> auto-converts HEIC/HEIF to a temporary JPEG (via the built-in `sips`) before parsing, and keeps the
+> original file. On other platforms, convert first (or set the iPhone camera to **Settings ▸ Camera ▸
+> Formats ▸ "Most Compatible"** to capture JPEG).
 
 ## Inspect the data
 

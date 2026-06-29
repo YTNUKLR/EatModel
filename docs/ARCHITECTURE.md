@@ -404,7 +404,8 @@ Deliberate simplifications in the first slice — recorded so they aren't mistak
 - **`unitPrice` falls back to `lineTotal`** when a line has no quantity. So a whole-package price can be
   recorded as if per-unit. Fine for trend-spotting; revisit before serious cost-per-nutrient math.
 - **`observed_at` defaults to today** when the receipt date is illegible — price points may be mis-dated.
-- **HEIC/HEIF images are skipped, not converted.** iPhone photos are often HEIC, which Claude vision
-  rejects; the CLI warns and skips. A convert step (or "Most Compatible" capture) is needed for those.
+- **HEIC/HEIF is auto-converted on macOS only.** iPhone photos are often HEIC, which Claude vision
+  rejects; the CLI converts them to a temporary JPEG via `sips` (keeping the original) before parsing.
+  On non-macOS platforms HEIC fails per-file with a clear message — convert manually or capture JPEG.
 - **No reporting yet.** Data accumulates in SQLite but there's no trend/price-history view — that's the
   next build (§7 Phase 3).
