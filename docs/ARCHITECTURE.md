@@ -743,3 +743,13 @@ because that's expensive to unwind once data piles up.
 | Both | Cross-photo duplicate (same recipe/receipt re-shot → different hash, not deduped) | Content-hash can't catch it; title/line similarity is a later nicety. |
 | Recipes | Steps/instructions not captured (ingredients-list-first) | Original image retained; re-parse when the cooking/preservation phase lands. |
 | Quality | **Recipe** parser eval harness (receipt eval shipped 2026-06-30; recipe one is the symmetric follow-up) | Scorer in `shared/eval.ts` generalizes; recipe lines need their own field checks (prepNote/optional, no price). Retained images + `raw_json` mean fixtures are free to backfill. |
+| Nutrition | Grow `foods` past the 9 manual seeds via a real **USDA FDC** import (keyed by `fdc_id`); could also seed `density_g_per_ml` / `grams_per_each` from FDC portion data | Reference data, re-derivable; the gated `food_id` links survive a catalog swap (§6, §10). |
+
+**Deferred non-blocking code cleanups** (flagged in the 2026-06-30 review; low risk, easily rediscovered, recorded so they aren't silently lost):
+
+| Area | Cleanup | Why it can wait |
+|---|---|---|
+| db | `backfillStoreLinks()` runs in the `Db` constructor on every open (idempotent via `WHERE store_id IS NULL`, so a no-op after the first pass) | Belongs in the one-shot migration, not the constructor; harmless at discovery scale. New receipts already get `store_id` at insert time. |
+| db | `listRecipeNutrition` is N+1 (one `recipeNutrition` query per recipe) | Fine for a household's recipe count; fold into a single join if it ever matters. |
+| Nutrition | `foods` seeds are labelled `source:'manual'` though clearly USDA-derived (no `fdc_id` recorded) | Honest as-is; the real FDC import (above) replaces them with `fdc_id`-keyed rows. |
+| Store match | `matchStore`/`matchIngredient` are still **exact-normalized-alias-only** — `WAL-MART #1234` ≠ `Walmart` will fragment | Same limitation as ingredients; `merge-store`/`merge` are the manual remedy until fuzzy matching slots into `resolveCanonical` (§4.3). |
