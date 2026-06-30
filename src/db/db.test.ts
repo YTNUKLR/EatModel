@@ -253,6 +253,17 @@ test("a whole multi-recipe page dedups on the one image hash", () => {
   db.close();
 });
 
+test("refuses to save a recipe page with an empty recipe", () => {
+  const db = freshDb();
+  assert.throws(
+    () => db.saveRecipePage(page([recipe([], "Empty recipe")]), "bad.jpg", "mock", "bad"),
+    /no ingredients/,
+  );
+  assert.equal(db.hasRecipe("bad"), false);
+  assert.equal(db.totals().recipes, 0);
+  db.close();
+});
+
 // --- Review gate ---------------------------------------------------------
 
 test("new ingredients start unconfirmed and confirm() promotes them", () => {
@@ -278,13 +289,49 @@ test("a flagged line is stored but never becomes a price observation", () => {
   );
 
   assert.equal(summary.lines[0]?.needsReview, true);
+  assert.equal(summary.lines[0]?.ingredientId, null);
+  assert.equal(summary.lines[0]?.confidence, "unmatched");
   assert.equal(summary.lines[0]?.pricedObserved, false); // not trusted as a fact
   assert.equal(summary.priceObservations, 0);
+  assert.equal(db.totals().ingredients, 0); // a bad identity never hardens into the spine
   assert.equal(db.totals().priceObservations, 0);
 
   const flagged = db.listLinesNeedingReview();
   assert.equal(flagged.length, 1);
   assert.equal(flagged[0]?.source, "receipt");
+  db.close();
+});
+
+test("a valid identity with a bad number is flagged but still attached to the spine", () => {
+  const db = freshDb();
+  const summary = db.saveReceipt(
+    receipt([line("Spinach", { unitPrice: -2 })]),
+    "a.jpg",
+    "mock",
+  );
+
+  assert.equal(summary.lines[0]?.needsReview, true);
+  assert.ok(summary.lines[0]?.ingredientId);
+  assert.equal(summary.lines[0]?.confidence, "new");
+  assert.equal(summary.lines[0]?.pricedObserved, false);
+  assert.equal(db.totals().ingredients, 1);
+  assert.equal(db.totals().priceObservations, 0);
+  db.close();
+});
+
+test("a recipe line with an invalid identity is stored without creating an ingredient", () => {
+  const db = freshDb();
+  const summary = db.saveRecipe(
+    recipe([ingredientLine("!!!")]),
+    "bad.jpg",
+    "mock",
+  );
+
+  assert.equal(summary.lines[0]?.needsReview, true);
+  assert.equal(summary.lines[0]?.ingredientId, null);
+  assert.equal(summary.lines[0]?.confidence, "unmatched");
+  assert.equal(db.totals().ingredients, 0);
+  assert.equal(db.listLinesNeedingReview()[0]?.source, "recipe");
   db.close();
 });
 
@@ -302,6 +349,34 @@ test("a receipt whose lines exceed the total is flagged for review", () => {
   assert.equal(summary.needsReview, true);
   assert.match(summary.reviewReason ?? "", /exceed/);
   assert.equal(db.listReceiptsNeedingReview().length, 1);
+  db.close();
+});
+
+test("reviewed line and receipt flags can be resolved", () => {
+  const db = freshDb();
+  db.saveReceipt(receipt([line("", { unitPrice: -2 })]), "line.jpg", "mock");
+  const lineReview = db.listLinesNeedingReview()[0];
+  assert.ok(lineReview);
+
+  db.resolveLineReview(lineReview.source, lineReview.lineId);
+  assert.equal(db.listLinesNeedingReview().length, 0);
+
+  db.saveReceipt(
+    {
+      store: "Test Mart",
+      purchasedAt: "2026-06-20",
+      total: 5,
+      currency: "USD",
+      lines: [line("A", { lineTotal: 6 })],
+    },
+    "receipt.jpg",
+    "mock",
+  );
+  const receiptReview = db.listReceiptsNeedingReview()[0];
+  assert.ok(receiptReview);
+
+  db.resolveReceiptReview(receiptReview.id);
+  assert.equal(db.listReceiptsNeedingReview().length, 0);
   db.close();
 });
 

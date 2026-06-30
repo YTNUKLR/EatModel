@@ -3,7 +3,12 @@ import path from "node:path";
 import Database from "better-sqlite3";
 import { normalizeName } from "../shared/units";
 import { deriveUnitPrice } from "../shared/pricing";
-import { isSaneNumber, reviewLineReason, reconcileReceiptTotal } from "../shared/review";
+import {
+  identityReviewReason,
+  isSaneNumber,
+  reviewLineReason,
+  reconcileReceiptTotal,
+} from "../shared/review";
 import type { ReceiptParseResult } from "../shared/types";
 import type { RecipeParseResult, RecipePage } from "../shared/recipe-types";
 
@@ -12,17 +17,22 @@ import type { RecipeParseResult, RecipePage } from "../shared/recipe-types";
  * repository layer: the rest of the app talks to these typed methods, never to
  * raw SQL. Swapping SQLite → Postgres later changes this file only.
  *
- * DDL is plain CREATE TABLE IF NOT EXISTS for the discovery phase (no migration
- * tooling yet — see ARCHITECTURE.md decision log).
+ * DDL is plain CREATE TABLE IF NOT EXISTS plus a tiny idempotent migration
+ * runner for the discovery phase (see ARCHITECTURE.md decision log).
  */
 const DDL = `
+CREATE TABLE IF NOT EXISTS schema_migrations (
+  name       TEXT PRIMARY KEY,
+  applied_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
 CREATE TABLE IF NOT EXISTS ingredients (
   id             INTEGER PRIMARY KEY AUTOINCREMENT,
   canonical_name TEXT NOT NULL,
   category       TEXT,
   -- Review gate: a freshly-minted ingredient is 'unconfirmed' until a human
   -- confirms (or merges) it, so unreviewed matches don't harden into the spine.
-  status         TEXT NOT NULL DEFAULT 'unconfirmed',
+  status         TEXT NOT NULL DEFAULT 'unconfirmed' CHECK (status IN ('unconfirmed', 'confirmed')),
   created_at     TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
@@ -32,7 +42,7 @@ CREATE TABLE IF NOT EXISTS ingredient_aliases (
   ingredient_id INTEGER NOT NULL REFERENCES ingredients(id),
   alias_text    TEXT NOT NULL,
   normalized    TEXT NOT NULL UNIQUE,
-  source        TEXT,
+  source        TEXT CHECK (source IS NULL OR source IN ('receipt', 'recipe', 'manual')),
   created_at    TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
@@ -47,7 +57,7 @@ CREATE TABLE IF NOT EXISTS receipts (
   parser         TEXT,
   raw_json       TEXT,
   -- Set when line items don't reconcile against the printed total (see review).
-  needs_review   INTEGER NOT NULL DEFAULT 0,
+  needs_review   INTEGER NOT NULL DEFAULT 0 CHECK (needs_review IN (0, 1)),
   review_reason  TEXT,
   parsed_at      TEXT NOT NULL DEFAULT (datetime('now'))
 );
@@ -62,9 +72,9 @@ CREATE TABLE IF NOT EXISTS receipt_line_items (
   unit_price       REAL,
   line_total       REAL,
   ingredient_id    INTEGER REFERENCES ingredients(id),
-  match_confidence TEXT,
+  match_confidence TEXT CHECK (match_confidence IN ('alias', 'new', 'unmatched')),
   -- Flagged (not dropped) when a value is untrustworthy — empty name, negative price, etc.
-  needs_review     INTEGER NOT NULL DEFAULT 0,
+  needs_review     INTEGER NOT NULL DEFAULT 0 CHECK (needs_review IN (0, 1)),
   review_reason    TEXT
 );
 
@@ -75,7 +85,7 @@ CREATE TABLE IF NOT EXISTS price_observations (
   store           TEXT,
   observed_at     TEXT,
   unit            TEXT,
-  unit_price      REAL,
+  unit_price      REAL NOT NULL CHECK (unit_price >= 0),
   currency        TEXT,
   source_line_id  INTEGER REFERENCES receipt_line_items(id)
 );
@@ -87,7 +97,7 @@ CREATE TABLE IF NOT EXISTS recipe_ingests (
   image_filename TEXT,
   image_sha256   TEXT UNIQUE,
   parser         TEXT,
-  recipe_count   INTEGER,
+  recipe_count   INTEGER CHECK (recipe_count > 0),
   raw_json       TEXT,
   parsed_at      TEXT NOT NULL DEFAULT (datetime('now'))
 );
@@ -111,11 +121,11 @@ CREATE TABLE IF NOT EXISTS recipe_ingredients (
   quantity         REAL,
   unit             TEXT,
   prep_note        TEXT,
-  optional         INTEGER,
+  optional         INTEGER NOT NULL CHECK (optional IN (0, 1)),
   ingredient_id    INTEGER REFERENCES ingredients(id),
-  match_confidence TEXT,
+  match_confidence TEXT CHECK (match_confidence IN ('alias', 'new', 'unmatched')),
   -- Flagged (not dropped) when a value is untrustworthy — empty name, negative qty.
-  needs_review     INTEGER NOT NULL DEFAULT 0,
+  needs_review     INTEGER NOT NULL DEFAULT 0 CHECK (needs_review IN (0, 1)),
   review_reason    TEXT
 );
 `;
@@ -124,8 +134,8 @@ export type MatchConfidence = "alias" | "new";
 
 export interface LineOutcome {
   description: string;
-  ingredientId: number;
-  confidence: MatchConfidence;
+  ingredientId: number | null;
+  confidence: MatchConfidence | "unmatched";
   unitPrice: number | null;
   unit: string | null;
   pricedObserved: boolean;
@@ -144,8 +154,8 @@ export interface SaveSummary {
 
 export interface RecipeLineOutcome {
   ingredient: string;
-  ingredientId: number;
-  confidence: MatchConfidence;
+  ingredientId: number | null;
+  confidence: MatchConfidence | "unmatched";
   optional: boolean;
   needsReview: boolean;
 }
@@ -212,10 +222,20 @@ export class Db {
     return cols.some((c) => c.name === column);
   }
 
+  private applyMigration(name: string, run: () => void): void {
+    const applied =
+      this.db.prepare("SELECT 1 FROM schema_migrations WHERE name = ?").get(name) !== undefined;
+    if (applied) return;
+
+    this.db.transaction(() => {
+      run();
+      this.db.prepare("INSERT INTO schema_migrations (name) VALUES (?)").run(name);
+    })();
+  }
+
   /**
-   * Discovery-phase migration (no migration tooling yet — ARCHITECTURE.md
-   * decision log). `CREATE TABLE IF NOT EXISTS` leaves pre-existing tables on
-   * their old shape, so we reconcile here:
+   * Discovery-phase migrations. `CREATE TABLE IF NOT EXISTS` leaves pre-existing
+   * tables on their old shape, so we reconcile here:
    *  - additive, recoverable changes → `ALTER TABLE ADD COLUMN` in place;
    *  - structural changes that can't be backfilled → fail loud and tell the
    *    user to `npm run db:reset` (a db created by an older EatModel).
@@ -226,36 +246,40 @@ export class Db {
     if (this.tableExists("recipes") && !this.columnExists("recipes", "ingest_id")) {
       throw new Error(
         "this database was created by an older EatModel schema and can't be auto-migrated " +
-          "(discovery phase has no migrations yet) — run `npm run db:reset` to recreate it.",
+          "by the discovery migration runner — run `npm run db:reset` to recreate it.",
       );
     }
 
-    // Added with the ingestion-safety work; recoverable on old receipt tables.
-    // (ALTER can't add a column with UNIQUE, so add it plain + a UNIQUE index.)
-    if (this.tableExists("receipts") && !this.columnExists("receipts", "image_sha256")) {
-      this.db.exec("ALTER TABLE receipts ADD COLUMN image_sha256 TEXT");
+    this.applyMigration("001_receipt_image_hash", () => {
+      // Added with the ingestion-safety work; recoverable on old receipt tables.
+      // (ALTER can't add a column with UNIQUE, so add it plain + a UNIQUE index.)
+      if (this.tableExists("receipts") && !this.columnExists("receipts", "image_sha256")) {
+        this.db.exec("ALTER TABLE receipts ADD COLUMN image_sha256 TEXT");
+      }
       this.db.exec(
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_receipts_image_sha256 ON receipts(image_sha256)",
       );
-    }
+    });
 
-    // Review-gate columns. ALTER ADD COLUMN with a DEFAULT backfills existing
-    // rows safely (pre-gate ingredients become 'unconfirmed', which is correct —
-    // they were never reviewed).
-    const reviewColumns: [string, string, string][] = [
-      ["ingredients", "status", "TEXT NOT NULL DEFAULT 'unconfirmed'"],
-      ["receipts", "needs_review", "INTEGER NOT NULL DEFAULT 0"],
-      ["receipts", "review_reason", "TEXT"],
-      ["receipt_line_items", "needs_review", "INTEGER NOT NULL DEFAULT 0"],
-      ["receipt_line_items", "review_reason", "TEXT"],
-      ["recipe_ingredients", "needs_review", "INTEGER NOT NULL DEFAULT 0"],
-      ["recipe_ingredients", "review_reason", "TEXT"],
-    ];
-    for (const [table, column, decl] of reviewColumns) {
-      if (this.tableExists(table) && !this.columnExists(table, column)) {
-        this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${decl}`);
+    this.applyMigration("002_review_gate_columns", () => {
+      // Review-gate columns. ALTER ADD COLUMN with a DEFAULT backfills existing
+      // rows safely (pre-gate ingredients become 'unconfirmed', which is correct —
+      // they were never reviewed).
+      const reviewColumns: [string, string, string][] = [
+        ["ingredients", "status", "TEXT NOT NULL DEFAULT 'unconfirmed'"],
+        ["receipts", "needs_review", "INTEGER NOT NULL DEFAULT 0"],
+        ["receipts", "review_reason", "TEXT"],
+        ["receipt_line_items", "needs_review", "INTEGER NOT NULL DEFAULT 0"],
+        ["receipt_line_items", "review_reason", "TEXT"],
+        ["recipe_ingredients", "needs_review", "INTEGER NOT NULL DEFAULT 0"],
+        ["recipe_ingredients", "review_reason", "TEXT"],
+      ];
+      for (const [table, column, decl] of reviewColumns) {
+        if (this.tableExists(table) && !this.columnExists(table, column)) {
+          this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${decl}`);
+        }
       }
-    }
+    });
   }
 
   /**
@@ -336,15 +360,21 @@ export class Db {
       let priceObservations = 0;
 
       for (const line of parsed.lines) {
-        const { ingredientId, confidence } = this.matchIngredient(line.description, "receipt");
-        if (confidence === "new") newIngredients++;
-
         // Flag (don't drop) lines with untrustworthy values — §5.5.
         const reason = reviewLineReason(line.description, [
           { label: "quantity", value: line.quantity },
           { label: "unitPrice", value: line.unitPrice },
           { label: "lineTotal", value: line.lineTotal },
         ]);
+        const invalidIdentity = identityReviewReason(line.description) != null;
+        let ingredientId: number | null = null;
+        let confidence: MatchConfidence | "unmatched" = "unmatched";
+        if (!invalidIdentity) {
+          const match = this.matchIngredient(line.description, "receipt");
+          ingredientId = match.ingredientId;
+          confidence = match.confidence;
+          if (confidence === "new") newIngredients++;
+        }
 
         const lineId = Number(
           this.db
@@ -376,7 +406,7 @@ export class Db {
         // Only record a price observation from a sane, non-flagged price — a
         // bad price must never become a "fact" downstream cost math trusts.
         let pricedObserved = false;
-        if (unitPrice != null && isSaneNumber(unitPrice) && !reason) {
+        if (ingredientId != null && unitPrice != null && isSaneNumber(unitPrice) && !reason) {
           this.db
             .prepare(
               `INSERT INTO price_observations
@@ -449,6 +479,13 @@ export class Db {
     parser: string,
     imageSha256: string | null = null,
   ): SaveRecipePageSummary {
+    if (page.recipes.length === 0) {
+      throw new Error("saveRecipePage: page has no recipes");
+    }
+    if (page.recipes.some((recipe) => recipe.ingredients.length === 0)) {
+      throw new Error("saveRecipePage: recipe has no ingredients");
+    }
+
     const run = this.db.transaction((): SaveRecipePageSummary => {
       const ingestId = Number(
         this.db
@@ -474,16 +511,22 @@ export class Db {
         let newIngredients = 0;
 
         for (const line of recipe.ingredients) {
-          const { ingredientId, confidence } = this.matchIngredient(line.ingredient, "recipe");
-          if (confidence === "new") {
-            newIngredients++;
-            pageNewIngredients++;
-          }
-
           // Flag (don't drop) lines with untrustworthy values — §5.5.
           const reason = reviewLineReason(line.ingredient, [
             { label: "quantity", value: line.quantity },
           ]);
+          const invalidIdentity = identityReviewReason(line.ingredient) != null;
+          let ingredientId: number | null = null;
+          let confidence: MatchConfidence | "unmatched" = "unmatched";
+          if (!invalidIdentity) {
+            const match = this.matchIngredient(line.ingredient, "recipe");
+            ingredientId = match.ingredientId;
+            confidence = match.confidence;
+            if (confidence === "new") {
+              newIngredients++;
+              pageNewIngredients++;
+            }
+          }
 
           this.db
             .prepare(
@@ -588,6 +631,21 @@ export class Db {
   confirmIngredient(id: number): void {
     const res = this.db.prepare("UPDATE ingredients SET status = 'confirmed' WHERE id = ?").run(id);
     if (res.changes === 0) throw new Error(`no ingredient with id ${id}`);
+  }
+
+  /** Mark a flagged line as reviewed. The original reason stays in raw data/history. */
+  resolveLineReview(source: "receipt" | "recipe", lineId: number): void {
+    const table = source === "receipt" ? "receipt_line_items" : "recipe_ingredients";
+    const exists = this.db.prepare(`SELECT 1 FROM ${table} WHERE id = ?`).get(lineId) !== undefined;
+    if (!exists) throw new Error(`no ${source} line with id ${lineId}`);
+    this.db.prepare(`UPDATE ${table} SET needs_review = 0 WHERE id = ?`).run(lineId);
+  }
+
+  /** Mark an unreconciled receipt as reviewed. */
+  resolveReceiptReview(id: number): void {
+    const exists = this.db.prepare("SELECT 1 FROM receipts WHERE id = ?").get(id) !== undefined;
+    if (!exists) throw new Error(`no receipt with id ${id}`);
+    this.db.prepare("UPDATE receipts SET needs_review = 0 WHERE id = ?").run(id);
   }
 
   /**

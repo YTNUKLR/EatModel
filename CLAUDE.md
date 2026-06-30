@@ -21,7 +21,8 @@ Two photo-ingest slices are live, both feeding the same SQLite spine via the `db
   → many `recipes`.
 - **Review / confidence gate (§5.5)** — new ingredients persist as `status='unconfirmed'`; untrustworthy
   lines are **flagged, not dropped** (and never become price facts); receipt totals are reconciled.
-  Resolve via `npm run review` (`list` / `confirm <id>` / `merge <from> <into>`).
+  Resolve via `npm run review` (`list` / `confirm <id>` / `merge <from> <into>` /
+  `resolve-line <receipt|recipe> <id>` / `resolve-receipt <id>`).
 
 **Next identity decision, not yet built:** a **store-identity spine** for receipts (`receipts.store` is
 still free text, which blocks "cheapest store"). See `ARCHITECTURE.md` §14 for the full deferred backlog.
@@ -32,7 +33,7 @@ still free text, which blocks "cheapest store"). See `ARCHITECTURE.md` §14 for 
 |---|---|
 | `npm run process` / `process:mock` | Ingest receipt photos from `receipts/inbox/` (real OCR / canned mock) |
 | `npm run recipes` / `recipes:mock` | Ingest recipe photos from `recipes/inbox/` |
-| `npm run review [-- confirm <id> \| merge <from> <into>]` | Inspect/resolve flagged data |
+| `npm run review [-- confirm <id> \| merge <from> <into> \| resolve-line <receipt\|recipe> <id> \| resolve-receipt <id>]` | Inspect/resolve flagged data |
 | `npm run check` | **Typecheck + tests — must be green before merging to `main`** |
 | `npm run db:reset` | Drop `data/eatmodel.db` (use if a db predates a schema change) |
 
@@ -56,8 +57,8 @@ still free text, which blocks "cheapest store"). See `ARCHITECTURE.md` §14 for 
 - **Real OCR needs `ANTHROPIC_API_KEY` in `.env`** (model `claude-opus-4-8`). The CLIs **fail loud** without
   it — the mock is reachable *only* via the `:mock` scripts, never as a silent fallback. `.env` is gitignored.
 - **HEIC/HEIF auto-convert is macOS-only** (via `sips`); other platforms must supply JPEG/PNG.
-- **Old-schema dbs:** `Db` runs an additive `migrate()` on open; if it can't reconcile it throws and tells
-  you to `npm run db:reset` (discovery phase has no full migration tooling).
+- **Old-schema dbs:** `Db` runs a tiny additive migration runner on open; if it can't reconcile it throws
+  and tells you to `npm run db:reset` (full migration tooling is deferred).
 - **Privacy:** `data/` and all inbox/processed/failed images are private and **gitignored** — never commit
   or sync them.
 - **Don't mutate the user's real `data/eatmodel.db` for demos** (e.g. `review -- confirm/merge`) — use a

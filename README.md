@@ -3,6 +3,12 @@
 A household meal-prep operating system: recipes, planning, grocery lists, macros, preservation,
 and **receipt-driven grocery price tracking**. Full design in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
+Useful docs:
+
+- [`docs/RUNBOOK.md`](docs/RUNBOOK.md) — how to operate the current CLI app.
+- [`docs/DATA_MODEL.md`](docs/DATA_MODEL.md) — SQLite schema, relationships, and invariants.
+- [`docs/CONVENTIONS.md`](docs/CONVENTIONS.md) — engineering conventions for this repo.
+
 This repo currently contains the first **discovery slices** — two symmetric capture pipelines that
 both feed one canonical "ingredient spine":
 
@@ -78,6 +84,8 @@ receipt whose items don't reconcile against its total is **flagged** rather than
 npm run review                       # list unconfirmed ingredients, flagged lines, unreconciled receipts
 npm run review -- confirm <id>       # mark an ingredient trusted
 npm run review -- merge <from> <into>  # fold a duplicate/abbreviation into its real ingredient
+npm run review -- resolve-line <receipt|recipe> <line-id>
+npm run review -- resolve-receipt <id>
 ```
 
 `merge` is how you de-fragment the spine by hand (e.g. fold `CHKN THGH` into `chicken thighs`) until

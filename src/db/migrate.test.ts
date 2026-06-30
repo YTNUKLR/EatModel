@@ -37,6 +37,16 @@ test("adds image_sha256 to a pre-ingestion-safety receipts table", () => {
   assert.ok(summary.receiptId > 0);
   assert.equal(db.hasReceipt("freshhash"), true); // the migrated column is queryable
   db.close();
+
+  const migrated = new Database(file);
+  const migrations = migrated
+    .prepare("SELECT name FROM schema_migrations ORDER BY name")
+    .all() as { name: string }[];
+  assert.deepEqual(
+    migrations.map((m) => m.name),
+    ["001_receipt_image_hash", "002_review_gate_columns"],
+  );
+  migrated.close();
 });
 
 test("refuses to open a pre-recipe-page database and points to db:reset", () => {
@@ -52,4 +62,56 @@ test("refuses to open a pre-recipe-page database and points to db:reset", () => 
   raw.close();
 
   assert.throws(() => new Db(file), /db:reset/);
+});
+
+test("fresh databases record migrations and enforce hard invariants", () => {
+  const file = tmpDbPath();
+  const db = new Db(file);
+  db.close();
+
+  const raw = new Database(file);
+  raw.pragma("foreign_keys = ON");
+
+  const migrations = raw
+    .prepare("SELECT name FROM schema_migrations ORDER BY name")
+    .all() as { name: string }[];
+  assert.deepEqual(
+    migrations.map((m) => m.name),
+    ["001_receipt_image_hash", "002_review_gate_columns"],
+  );
+
+  assert.throws(
+    () => raw.prepare("INSERT INTO ingredients (canonical_name, status) VALUES ('Salt', 'bogus')").run(),
+    /CHECK/,
+  );
+  assert.throws(
+    () => raw.prepare("INSERT INTO receipts (needs_review) VALUES (7)").run(),
+    /CHECK/,
+  );
+
+  const receiptId = Number(raw.prepare("INSERT INTO receipts (store) VALUES ('Test')").run().lastInsertRowid);
+  assert.throws(
+    () =>
+      raw
+        .prepare("INSERT INTO receipt_line_items (receipt_id, match_confidence) VALUES (?, 'guess')")
+        .run(receiptId),
+    /CHECK/,
+  );
+  assert.throws(
+    () => raw.prepare("INSERT INTO recipe_ingests (recipe_count) VALUES (0)").run(),
+    /CHECK/,
+  );
+
+  const ingredientId = Number(
+    raw.prepare("INSERT INTO ingredients (canonical_name) VALUES ('Salt')").run().lastInsertRowid,
+  );
+  assert.throws(
+    () =>
+      raw
+        .prepare("INSERT INTO price_observations (ingredient_id, unit_price) VALUES (?, -1)")
+        .run(ingredientId),
+    /CHECK/,
+  );
+
+  raw.close();
 });

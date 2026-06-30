@@ -12,6 +12,10 @@ const USAGE = `Review gate — inspect and resolve what the ingest flagged.
   npm run review -- confirm <id>  mark ingredient <id> as confirmed (trusted spine)
   npm run review -- merge <from> <into>
                                   fold ingredient <from> into <into> (de-fragment the spine)
+  npm run review -- resolve-line <receipt|recipe> <line-id>
+                                  clear a flagged line after human review
+  npm run review -- resolve-receipt <id>
+                                  clear a receipt total warning after human review
 `;
 
 function list(db: Db): void {
@@ -39,7 +43,9 @@ function list(db: Db): void {
 
   if (ingredients.length || lines.length || receipts.length) {
     console.log(
-      `\nResolve with:  npm run review -- confirm <id>   |   npm run review -- merge <from> <into>`,
+      `\nResolve with:  npm run review -- confirm <id>   |   npm run review -- merge <from> <into>` +
+        `   |   npm run review -- resolve-line <receipt|recipe> <line-id>` +
+        `   |   npm run review -- resolve-receipt <id>`,
     );
   }
 }
@@ -65,6 +71,18 @@ function main(): void {
       const into = intArg(rest[1], "<into> id");
       db.mergeIngredient(from, into);
       console.log(`✓ merged ingredient #${from} into #${into}`);
+    } else if (cmd === "resolve-line") {
+      const source = rest[0];
+      if (source !== "receipt" && source !== "recipe") {
+        throw new Error(`expected line source "receipt" or "recipe", got "${source ?? ""}"`);
+      }
+      const lineId = intArg(rest[1], "line id");
+      db.resolveLineReview(source, lineId);
+      console.log(`✓ resolved ${source} line #${lineId}`);
+    } else if (cmd === "resolve-receipt") {
+      const id = intArg(rest[0], "receipt id");
+      db.resolveReceiptReview(id);
+      console.log(`✓ resolved receipt #${id}`);
     } else {
       console.log(USAGE);
       process.exitCode = 1;

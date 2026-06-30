@@ -1,3 +1,5 @@
+import { normalizeName } from "./units";
+
 /**
  * Pure boundary-validation logic for the review gate. These decide whether a
  * line or receipt should be *flagged for review* — never whether to drop it.
@@ -14,6 +16,13 @@ export function isSaneNumber(value: number | null): boolean {
   return value == null || (Number.isFinite(value) && value >= 0);
 }
 
+/** Returns a reason the text cannot safely resolve to an ingredient identity. */
+export function identityReviewReason(text: string): string | null {
+  if (text.trim() === "") return "empty name";
+  if (normalizeName(text) === "") return "name has no searchable characters";
+  return null;
+}
+
 /**
  * Returns a human-readable reason a line should be reviewed, or null if it's
  * fine. `text` is the product/ingredient name; `numbers` are the numeric fields
@@ -24,7 +33,8 @@ export function reviewLineReason(
   numbers: { label: string; value: number | null }[],
 ): string | null {
   const reasons: string[] = [];
-  if (text.trim() === "") reasons.push("empty name");
+  const identityReason = identityReviewReason(text);
+  if (identityReason) reasons.push(identityReason);
   for (const { label, value } of numbers) {
     if (!isSaneNumber(value)) reasons.push(`invalid ${label} (${value})`);
   }

@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { isSaneNumber, reviewLineReason, reconcileReceiptTotal } from "./review";
+import { identityReviewReason, isSaneNumber, reviewLineReason, reconcileReceiptTotal } from "./review";
 
 test("isSaneNumber accepts null and non-negative finite numbers, rejects the rest", () => {
   assert.equal(isSaneNumber(null), true); // unknown is fine
@@ -18,6 +18,12 @@ test("reviewLineReason passes a clean line", () => {
 test("reviewLineReason flags an empty name", () => {
   const reason = reviewLineReason("   ", [{ label: "unitPrice", value: 2.49 }]);
   assert.match(reason ?? "", /empty name/);
+});
+
+test("identityReviewReason flags punctuation-only names", () => {
+  assert.equal(identityReviewReason("Chicken thighs"), null);
+  assert.match(identityReviewReason("!!!") ?? "", /searchable/);
+  assert.match(reviewLineReason("!!!", [{ label: "unitPrice", value: 2.49 }]) ?? "", /searchable/);
 });
 
 test("reviewLineReason flags a negative price but reports all problems", () => {

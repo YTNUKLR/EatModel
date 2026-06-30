@@ -1,20 +1,12 @@
 import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
+import { pathToFileURL } from "node:url";
 import { Db, type SaveRecipePageSummary } from "../db/db";
 import { selectRecipeParser } from "./select-recipe-parser";
 import { prepareImage } from "./prepare-image";
 import { processedName } from "./processed-name";
 import type { RecipePage } from "../shared/recipe-types";
-
-// Load .env (Node 22+) so ANTHROPIC_API_KEY etc. are available with no extra
-// tooling. Without this, a filled-in .env would be ignored entirely.
-if (fs.existsSync(".env")) process.loadEnvFile(".env");
-
-const INBOX = process.env.EATMODEL_RECIPE_INBOX ?? "recipes/inbox";
-const PROCESSED = process.env.EATMODEL_RECIPE_PROCESSED ?? "recipes/processed";
-const FAILED = process.env.EATMODEL_RECIPE_FAILED ?? "recipes/failed";
-const DB_PATH = process.env.EATMODEL_DB ?? "data/eatmodel.db";
 
 // Formats the parser reads directly, plus HEIC/HEIF which we convert first.
 const PARSEABLE_EXTS = new Set([".jpg", ".jpeg", ".png", ".gif", ".webp"]);
@@ -41,7 +33,8 @@ function printPage(
     const serves = parsed?.servings != null ? ` · serves ${parsed.servings}` : "";
     console.log(`    • ${title}${src}${serves}  —  recipe #${r.recipeId}`);
     for (const line of r.lines) {
-      const tag = line.confidence === "new" ? "＋new" : " alias";
+      const tag =
+        line.confidence === "new" ? "＋new" : line.confidence === "alias" ? " alias" : " no match";
       const opt = line.optional ? "  (optional)" : "";
       const flag = line.needsReview ? "  ⚠ review" : "";
       console.log(`        [${tag}] ${line.ingredient}${opt}${flag}`);
@@ -53,28 +46,33 @@ function printPage(
   );
 }
 
-async function main(): Promise<void> {
-  fs.mkdirSync(INBOX, { recursive: true });
-  fs.mkdirSync(PROCESSED, { recursive: true });
+export async function processRecipes(env: NodeJS.ProcessEnv = process.env): Promise<void> {
+  const inbox = env.EATMODEL_RECIPE_INBOX ?? "recipes/inbox";
+  const processed = env.EATMODEL_RECIPE_PROCESSED ?? "recipes/processed";
+  const failedDir = env.EATMODEL_RECIPE_FAILED ?? "recipes/failed";
+  const dbPath = env.EATMODEL_DB ?? "data/eatmodel.db";
+
+  fs.mkdirSync(inbox, { recursive: true });
+  fs.mkdirSync(processed, { recursive: true });
 
   const images = fs
-    .readdirSync(INBOX)
+    .readdirSync(inbox)
     .filter((f) => INGEST_EXTS.has(path.extname(f).toLowerCase()));
 
   if (images.length === 0) {
-    console.log(`No images in ${INBOX}/ — drop recipe photos there (or point EATMODEL_RECIPE_INBOX at your synced folder) and re-run.`);
+    console.log(`No images in ${inbox}/ — drop recipe photos there (or point EATMODEL_RECIPE_INBOX at your synced folder) and re-run.`);
     return;
   }
 
-  const parser = selectRecipeParser(process.env); // throws (fail loud) if llm is chosen with no key
-  const db = new Db(DB_PATH);
-  console.log(`parser: ${parser.name}  ·  db: ${DB_PATH}  ·  ${images.length} image(s)\n`);
+  const parser = selectRecipeParser(env); // throws (fail loud) if llm is chosen with no key
+  const db = new Db(dbPath);
+  console.log(`parser: ${parser.name}  ·  db: ${dbPath}  ·  ${images.length} image(s)\n`);
 
   let ok = 0;
   let skipped = 0;
   let failed = 0;
   for (const file of images) {
-    const full = path.join(INBOX, file);
+    const full = path.join(inbox, file);
     let prepared: ReturnType<typeof prepareImage> | undefined;
     try {
       // Content-hash dedup: skip (and don't re-call the API) if already ingested.
@@ -82,7 +80,7 @@ async function main(): Promise<void> {
       const dest = processedName(hash, file); // hash-prefixed so same-named images don't clobber
       if (db.hasRecipe(hash)) {
         console.log(`↷ ${file}: already ingested — skipping\n`);
-        fs.renameSync(full, path.join(PROCESSED, dest));
+        fs.renameSync(full, path.join(processed, dest));
         skipped++;
         continue;
       }
@@ -93,16 +91,27 @@ async function main(): Promise<void> {
       // No recipe found → quarantine, don't save. Saving a 0-recipe page would
       // dedup the image as "done" and re-billing it would never re-extract it.
       if (page.recipes.length === 0) {
-        fs.mkdirSync(FAILED, { recursive: true });
-        fs.renameSync(full, path.join(FAILED, dest));
-        console.warn(`⚠ ${file}: no recipe found — moved to ${FAILED}/ for review (not saved)\n`);
+        fs.mkdirSync(failedDir, { recursive: true });
+        fs.renameSync(full, path.join(failedDir, dest));
+        console.warn(`⚠ ${file}: no recipe found — moved to ${failedDir}/ for review (not saved)\n`);
+        failed++;
+        continue;
+      }
+      const emptyRecipe = page.recipes.find((recipe) => recipe.ingredients.length === 0);
+      if (emptyRecipe) {
+        fs.mkdirSync(failedDir, { recursive: true });
+        fs.renameSync(full, path.join(failedDir, dest));
+        const title = emptyRecipe.title ?? "(untitled recipe)";
+        console.warn(
+          `⚠ ${file}: recipe "${title}" has no ingredients — moved to ${failedDir}/ for review (not saved)\n`,
+        );
         failed++;
         continue;
       }
 
       const summary = db.saveRecipePage(page, file, parser.name, hash);
       printPage(file, page, summary, prepared.converted);
-      fs.renameSync(full, path.join(PROCESSED, dest)); // drain the inbox; keep the original
+      fs.renameSync(full, path.join(processed, dest)); // drain the inbox; keep the original
       ok++;
     } catch (err) {
       console.error(`✗ ${file}: ${(err as Error).message}\n`);
@@ -125,7 +134,17 @@ async function main(): Promise<void> {
   db.close();
 }
 
-main().catch((err) => {
-  console.error((err as Error).message);
-  process.exitCode = 1;
-});
+function isMain(): boolean {
+  return process.argv[1] != null && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href;
+}
+
+if (isMain()) {
+  // Load .env (Node 22+) so ANTHROPIC_API_KEY etc. are available with no extra
+  // tooling. Without this, a filled-in .env would be ignored entirely.
+  if (fs.existsSync(".env")) process.loadEnvFile(".env");
+
+  processRecipes().catch((err) => {
+    console.error((err as Error).message);
+    process.exitCode = 1;
+  });
+}
