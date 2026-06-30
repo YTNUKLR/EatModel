@@ -1,115 +1,143 @@
 # EatModel
 
-A household meal-prep operating system: recipes, planning, grocery lists, macros, preservation,
-and **receipt-driven grocery price tracking**. Full design in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
+EatModel is a household meal-prep operating system in its discovery phase. The long-term goal is to connect recipes, meal planning, grocery lists, pantry/freezer inventory, nutrition, and grocery price history through one shared ingredient model.
 
-Useful docs:
+Today this repo is a local TypeScript CLI app for proving the hardest data flows:
 
-- [`docs/RUNBOOK.md`](docs/RUNBOOK.md) — how to operate the current CLI app.
-- [`docs/DATA_MODEL.md`](docs/DATA_MODEL.md) — SQLite schema, relationships, and invariants.
-- [`docs/CONVENTIONS.md`](docs/CONVENTIONS.md) — engineering conventions for this repo.
+- Receipt photos -> structured line items -> SQLite price history.
+- Recipe photos -> structured ingredient lists -> SQLite recipe collection.
+- Both flows resolve to one canonical ingredient spine.
+- Human review keeps questionable data provisional instead of silently trusting it.
 
-This repo currently contains the first **discovery slices** — two symmetric capture pipelines that
-both feed one canonical "ingredient spine":
+There is no mobile app, server, auth, grocery-list UI, nutrition model, or pantry model yet.
 
-1. **Receipts** → structured line items → SQLite price history.
-2. **Recipes** → structured ingredient list → SQLite recipe collection.
-
-In both: snap a photo → (later) it syncs to your laptop via a Dropbox/iCloud folder → a CLI turns it
-into structured data via Claude vision → and writes to SQLite. Capture and processing are decoupled;
-the folder is the queue.
-
-## Flow
+## Current Slice
 
 ```
-phone photo ──▶ synced inbox folder ──▶ process-receipts CLI
-                                          ├─ ReceiptParser (Claude vision)  → structured line items
-                                          ├─ ingredient matching            → canonical "spine" ◀──┐
-                                          └─ SQLite                         → receipts + price history │
-                                                                                                      │ shared
-phone photo ──▶ synced inbox folder ──▶ process-recipes CLI                                           │ spine
-                                          ├─ RecipeParser (Claude vision)   → structured ingredients  │
-                                          ├─ ingredient matching            → canonical "spine" ◀─────┘
-                                          └─ SQLite                         → recipes + ingredients
+phone photo -> synced inbox folder -> CLI parser -> SQLite
+
+receipts/inbox/  -> process-receipts -> receipts + receipt_line_items + price_observations
+recipes/inbox/   -> process-recipes  -> recipe_ingests + recipes + recipe_ingredients
+
+both pipelines -> ingredients + ingredient_aliases
 ```
+
+Capture is intentionally dumb: take photos on the phone and let Dropbox/iCloud/Drive sync them to an inbox folder. Processing happens later from the laptop. The synced folder is the queue.
+
+## Docs
+
+- [docs/RUNBOOK.md](docs/RUNBOOK.md): operate the current CLI app.
+- [docs/DATA_MODEL.md](docs/DATA_MODEL.md): SQLite schema, relationships, invariants, null semantics.
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md): product/architecture rationale and decision log.
+- [docs/CONVENTIONS.md](docs/CONVENTIONS.md): engineering conventions.
+- [CLAUDE.md](CLAUDE.md): short orientation for AI agents working in this repo.
 
 ## Setup
 
-Requires Node ≥ 22.
+Requires Node 22 or newer.
 
 ```sh
 npm install
-cp .env.example .env        # then add your ANTHROPIC_API_KEY for real OCR
+cp .env.example .env
+npm run check
 ```
 
-## Run
+For real OCR, add `ANTHROPIC_API_KEY` to `.env`. Mock commands do not need a key.
 
-**Verify the plumbing with no API key (mock parser, canned data):**
+## Commands
+
+| Command | Purpose |
+|---|---|
+| `npm run process` | Process real receipt photos from `receipts/inbox/`. |
+| `npm run process:mock` | Run receipt ingestion with canned parser output. |
+| `npm run recipes` | Process real recipe photos from `recipes/inbox/`. |
+| `npm run recipes:mock` | Run recipe ingestion with canned parser output. |
+| `npm run review` | List unconfirmed ingredients, flagged lines, and unreconciled receipts. |
+| `npm run review -- confirm <id>` | Mark an ingredient as trusted. |
+| `npm run review -- merge <from> <into>` | Fold a duplicate/fragment ingredient into another. |
+| `npm run review -- resolve-line <receipt\|recipe> <line-id>` | Clear a reviewed line flag. |
+| `npm run review -- resolve-receipt <id>` | Clear a reviewed receipt total warning. |
+| `npm run db:reset` | Remove the default local SQLite database and sidecars. |
+| `npm run check` | Typecheck and run tests. |
+
+## Quick Start
+
+Verify the receipt pipeline without an API key:
 
 ```sh
 npm run process:mock
+npm run review
 ```
 
-**Process real receipt photos:** drop `.jpg`/`.png` images into `receipts/inbox/` (or point
-`EATMODEL_INBOX` at your synced Dropbox folder), set `ANTHROPIC_API_KEY`, then:
+Verify the recipe pipeline without an API key:
 
 ```sh
-npm run process
+npm run recipes:mock
+npm run review
 ```
 
-**Recipes** work the same way — photograph a recipe (e.g. a cookbook page) into `recipes/inbox/`
-(or `EATMODEL_RECIPE_INBOX`), then:
+For real photos:
 
-```sh
-npm run recipes        # real OCR (needs ANTHROPIC_API_KEY)
-npm run recipes:mock   # canned recipe, no key/cost — verify the plumbing
-```
+1. Put receipt images in `receipts/inbox/` or set `EATMODEL_INBOX`.
+2. Put recipe images in `recipes/inbox/` or set `EATMODEL_RECIPE_INBOX`.
+3. Set `ANTHROPIC_API_KEY` in `.env`.
+4. Run `npm run process` or `npm run recipes`.
+5. Run `npm run review` and confirm/merge/resolve what was flagged.
 
-v1 captures the **ingredient list** (title, source, servings, ingredients), not the step-by-step
-instructions — the original image is kept so steps can be re-parsed later. A single photo can hold
-**multiple recipes** (e.g. a cookbook spread); each is saved separately under one image "ingest".
-Recipe ingredients resolve to the *same* canonical ingredients as receipts.
+Processed originals move to the matching `processed/` folder as `<sha12>-<original-name>`. Failed parses move to the matching `failed/` folder and are not saved to the database.
 
-Processed images move to the matching `processed/` folder; data lands in `data/eatmodel.db`. Re-run
-anytime — each inbox is drained per pass, and re-ingesting the same photo is a no-op (content-hash
-dedup). `npm run db:reset` clears the database.
+## Data Safety
 
-## Review what was ingested
+The current design is deliberately conservative:
 
-New ingredients land as **unconfirmed**, and any untrustworthy line (empty name, negative price) or a
-receipt whose items don't reconcile against its total is **flagged** rather than silently trusted
-(see `docs/ARCHITECTURE.md` §5.5). Inspect and resolve:
+- Re-ingesting the same exact image is idempotent via content hash.
+- Original images are retained for future reparsing.
+- Parser output is stored as `raw_json`.
+- Missing facts are stored as `null`, not guessed.
+- Bad line values are flagged, not dropped.
+- Invalid ingredient identities stay unlinked instead of minting garbage canonical ingredients.
+- Flagged prices never become `price_observations`.
 
-```sh
-npm run review                       # list unconfirmed ingredients, flagged lines, unreconciled receipts
-npm run review -- confirm <id>       # mark an ingredient trusted
-npm run review -- merge <from> <into>  # fold a duplicate/abbreviation into its real ingredient
-npm run review -- resolve-line <receipt|recipe> <line-id>
-npm run review -- resolve-receipt <id>
-```
+SQLite data lands in `data/eatmodel.db`. Local data and image queues are gitignored.
 
-`merge` is how you de-fragment the spine by hand (e.g. fold `CHKN THGH` into `chicken thighs`) until
-automatic fuzzy matching arrives.
+## HEIC Notes
 
-> iPhone photos are often HEIC, which Claude vision doesn't accept directly. On **macOS** the CLI
-> auto-converts HEIC/HEIF to a temporary JPEG (via the built-in `sips`) before parsing, and keeps the
-> original file. On other platforms, convert first (or set the iPhone camera to **Settings ▸ Camera ▸
-> Formats ▸ "Most Compatible"** to capture JPEG).
+iPhone photos are often HEIC/HEIF, which Claude vision does not accept directly. On macOS, the CLI converts HEIC/HEIF to a temporary JPEG with `sips` and keeps the original. On other platforms, convert images first or configure the phone camera for JPEG capture.
 
-## Inspect the data
+## Inspect Data
+
+Example price-history query:
 
 ```sh
 sqlite3 data/eatmodel.db "SELECT canonical_name, store, observed_at, unit_price, unit FROM price_observations JOIN ingredients ON ingredients.id = price_observations.ingredient_id ORDER BY observed_at;"
 ```
 
+More inspection commands are in [docs/RUNBOOK.md](docs/RUNBOOK.md).
+
 ## Layout
 
 ```
 src/
-  shared/   types (zod schemas) + unit/name normalization — the shared contracts
-  parser/   ReceiptParser + RecipeParser interfaces, each with an LLM (Claude vision) + Mock impl
-  db/       SQLite repository: the shared ingredient spine + receipt/price and recipe tables
-  cli/      process-receipts / process-recipes — drain an inbox, parse, match, persist
+  shared/   zod schemas, pricing, review checks, normalization
+  parser/   receipt/recipe parser interfaces plus LLM and mock implementations
+  db/       SQLite repository and migration/constraint tests
+  cli/      receipt/recipe processing, review commands, CLI integration tests
+docs/
+  ARCHITECTURE.md
+  CONVENTIONS.md
+  DATA_MODEL.md
+  RUNBOOK.md
 ```
 
-These folders mirror the future `packages/*`; see the build note in `docs/ARCHITECTURE.md`.
+The folders mirror the likely future `packages/*` split. Keeping it as one TypeScript package avoids monorepo tooling during discovery.
+
+## Known Gaps
+
+- Store identity is still free text, so `Walmart`, `WAL-MART #1234`, and `WM SUPERCENTER` do not converge.
+- Ingredient matching is exact normalized alias matching only.
+- Unit conversion is not modeled yet.
+- Recipe instructions are not captured yet.
+- Content-hash dedup cannot catch re-shot duplicate receipts or recipes.
+- Fresh databases have `CHECK` constraints, but existing SQLite tables are not rebuilt just to retrofit constraints.
+
+The next identity-focused slice should be a store spine for receipts.
