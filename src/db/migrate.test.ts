@@ -44,7 +44,12 @@ test("adds image_sha256 to a pre-ingestion-safety receipts table", () => {
     .all() as { name: string }[];
   assert.deepEqual(
     migrations.map((m) => m.name),
-    ["001_receipt_image_hash", "002_review_gate_columns"],
+    ["001_receipt_image_hash", "002_review_gate_columns", "003_foods_nutrition", "004_store_identity"],
+  );
+  assert.equal((migrated.prepare("SELECT COUNT(*) AS n FROM stores").get() as { n: number }).n, 2);
+  assert.equal(
+    (migrated.prepare("SELECT COUNT(*) AS n FROM receipts WHERE store_id IS NOT NULL").get() as { n: number }).n,
+    2,
   );
   migrated.close();
 });
@@ -77,7 +82,7 @@ test("fresh databases record migrations and enforce hard invariants", () => {
     .all() as { name: string }[];
   assert.deepEqual(
     migrations.map((m) => m.name),
-    ["001_receipt_image_hash", "002_review_gate_columns"],
+    ["001_receipt_image_hash", "002_review_gate_columns", "003_foods_nutrition", "004_store_identity"],
   );
 
   assert.throws(
@@ -88,8 +93,19 @@ test("fresh databases record migrations and enforce hard invariants", () => {
     () => raw.prepare("INSERT INTO receipts (needs_review) VALUES (7)").run(),
     /CHECK/,
   );
+  assert.throws(
+    () => raw.prepare("INSERT INTO stores (canonical_name, status) VALUES ('Test', 'bogus')").run(),
+    /CHECK/,
+  );
 
   const receiptId = Number(raw.prepare("INSERT INTO receipts (store) VALUES ('Test')").run().lastInsertRowid);
+  assert.throws(
+    () =>
+      raw
+        .prepare("INSERT INTO receipts (store, store_match_confidence) VALUES ('Test', 'guess')")
+        .run(),
+    /CHECK/,
+  );
   assert.throws(
     () =>
       raw
@@ -110,6 +126,24 @@ test("fresh databases record migrations and enforce hard invariants", () => {
       raw
         .prepare("INSERT INTO price_observations (ingredient_id, unit_price) VALUES (?, -1)")
         .run(ingredientId),
+    /CHECK/,
+  );
+  assert.throws(
+    () =>
+      raw
+        .prepare(
+          `INSERT INTO foods
+             (description, source, calories_per_100g, protein_g_per_100g, carbs_g_per_100g, fat_g_per_100g)
+           VALUES ('Bad food', 'manual', -1, 0, 0, 0)`,
+        )
+        .run(),
+    /CHECK/,
+  );
+  assert.throws(
+    () =>
+      raw
+        .prepare("INSERT INTO ingredients (canonical_name, food_link_status) VALUES ('Bad link', 'confirmed')")
+        .run(),
     /CHECK/,
   );
 

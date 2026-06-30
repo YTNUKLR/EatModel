@@ -6,7 +6,9 @@ import { Db, type SaveRecipePageSummary } from "../db/db";
 import { selectRecipeParser } from "./select-recipe-parser";
 import { prepareImage } from "./prepare-image";
 import { processedName } from "./processed-name";
+import { formatRecipeNutrition } from "./nutrition-format";
 import type { RecipePage } from "../shared/recipe-types";
+import type { RecipeNutritionSummary } from "../db/db";
 
 // Formats the parser reads directly, plus HEIC/HEIF which we convert first.
 const PARSEABLE_EXTS = new Set([".jpg", ".jpeg", ".png", ".gif", ".webp"]);
@@ -21,6 +23,7 @@ function printPage(
   file: string,
   page: RecipePage,
   summary: SaveRecipePageSummary,
+  nutrition: RecipeNutritionSummary[],
   converted: boolean,
 ): void {
   const note = converted ? "  [converted HEIC→JPEG]" : "";
@@ -38,6 +41,12 @@ function printPage(
       const opt = line.optional ? "  (optional)" : "";
       const flag = line.needsReview ? "  ⚠ review" : "";
       console.log(`        [${tag}] ${line.ingredient}${opt}${flag}`);
+    }
+    const recipeNutrition = nutrition[i];
+    if (recipeNutrition) {
+      for (const nutritionLine of formatRecipeNutrition(recipeNutrition)) {
+        console.log(`        ${nutritionLine}`);
+      }
     }
   });
   console.log(
@@ -110,7 +119,8 @@ export async function processRecipes(env: NodeJS.ProcessEnv = process.env): Prom
       }
 
       const summary = db.saveRecipePage(page, file, parser.name, hash);
-      printPage(file, page, summary, prepared.converted);
+      const nutrition = summary.recipes.map((r) => db.recipeNutrition(r.recipeId));
+      printPage(file, page, summary, nutrition, prepared.converted);
       fs.renameSync(full, path.join(processed, dest)); // drain the inbox; keep the original
       ok++;
     } catch (err) {

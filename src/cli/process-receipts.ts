@@ -30,7 +30,13 @@ function printReceipt(
   const where = parsed.store ?? "(unknown store)";
   const when = parsed.purchasedAt ?? "(no date)";
   const note = converted ? "  [converted HEIC→JPEG]" : "";
-  console.log(`✓ ${file}${note}  →  ${where} · ${when} · total ${money(parsed.total, parsed.currency)}`);
+  const storeTag =
+    summary.storeConfidence === "new"
+      ? "  ＋new store"
+      : summary.storeConfidence === "alias"
+        ? "  store alias"
+        : "  no store match";
+  console.log(`✓ ${file}${note}  →  ${where}${storeTag} · ${when} · total ${money(parsed.total, parsed.currency)}`);
   for (const line of summary.lines) {
     const tag =
       line.confidence === "new" ? "＋new" : line.confidence === "alias" ? " alias" : " no match";

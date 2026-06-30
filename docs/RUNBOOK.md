@@ -90,8 +90,11 @@ npm run review
 This lists:
 
 - Unconfirmed ingredients.
+- Unconfirmed stores.
 - Receipt/recipe lines flagged for review.
 - Receipts whose line totals do not reconcile against the printed total.
+- Proposed ingredient→food nutrition links awaiting confirmation.
+- Confirmed ingredients that still have no nutrition link.
 
 Resolve ingredient identity:
 
@@ -102,6 +105,15 @@ npm run review -- merge <from-id> <into-id>
 
 Use `confirm` when a new ingredient is a real canonical ingredient. Use `merge` when a fragment, abbreviation, or duplicate should be folded into another ingredient.
 
+Resolve store identity:
+
+```sh
+npm run review -- confirm-store <store-id>
+npm run review -- merge-store <from-id> <into-id>
+```
+
+Use `confirm-store` when a parsed store name is a real canonical store. Use `merge-store` when variants such as `WAL-MART #1234` and `Walmart` should be folded together. Raw `receipts.store` text is kept either way.
+
 Resolve review flags after inspection:
 
 ```sh
@@ -111,12 +123,37 @@ npm run review -- resolve-receipt <receipt-id>
 
 Resolving a flag removes it from the active review queue. The stored row and original parse JSON remain available for later audit or reparsing.
 
+Nutrition review:
+
+```sh
+npm run review -- foods chicken
+npm run review -- link-food <ingredient-id> <food-id>
+npm run review -- confirm-food <ingredient-id>
+npm run review -- unlink-food <ingredient-id>
+```
+
+`link-food` is provisional. Recipe macro rollups only use the link after `confirm-food`.
+
+Add conversion hints when a recipe is partial because a unit cannot become grams:
+
+```sh
+npm run review -- set-density <ingredient-id> <g-per-ml>
+npm run review -- set-each-grams <ingredient-id> <grams>
+```
+
+Inspect nutrition:
+
+```sh
+npm run review -- nutrition
+npm run review -- nutrition <recipe-id>
+```
+
 ## Inspecting Data
 
 Quick price-history query:
 
 ```sh
-sqlite3 data/eatmodel.db "SELECT canonical_name, store, observed_at, unit_price, unit FROM price_observations JOIN ingredients ON ingredients.id = price_observations.ingredient_id ORDER BY observed_at;"
+sqlite3 data/eatmodel.db "SELECT ingredients.canonical_name, stores.canonical_name AS canonical_store, price_observations.store AS raw_store, observed_at, unit_price, unit FROM price_observations JOIN ingredients ON ingredients.id = price_observations.ingredient_id LEFT JOIN stores ON stores.id = price_observations.store_id ORDER BY observed_at;"
 ```
 
 Quick pending-review counts:
@@ -126,6 +163,8 @@ sqlite3 data/eatmodel.db "SELECT COUNT(*) FROM ingredients WHERE status = 'uncon
 sqlite3 data/eatmodel.db "SELECT COUNT(*) FROM receipt_line_items WHERE needs_review = 1;"
 sqlite3 data/eatmodel.db "SELECT COUNT(*) FROM recipe_ingredients WHERE needs_review = 1;"
 sqlite3 data/eatmodel.db "SELECT COUNT(*) FROM receipts WHERE needs_review = 1;"
+sqlite3 data/eatmodel.db "SELECT COUNT(*) FROM ingredients WHERE food_link_status = 'proposed';"
+sqlite3 data/eatmodel.db "SELECT COUNT(*) FROM stores WHERE status = 'unconfirmed';"
 ```
 
 ## Resetting Local Data
@@ -168,4 +207,8 @@ Dedup is content-hash based. A re-shot image has different bytes and will not be
 
 **The same store appears under many names**
 
-Store identity is still free text. A store spine is the next identity decision before serious cross-store comparisons.
+Run `npm run review`, then use `merge-store <from> <into>` to fold duplicate store identities. Automatic fuzzy store matching is intentionally deferred; exact normalized aliases are the current matcher.
+
+**Recipe nutrition is partial**
+
+Run `npm run review -- nutrition <recipe-id>` and read the gap reasons. Common fixes are confirming a food link, setting `grams_per_each` for cloves/each, or setting `density_g_per_ml` for cups/tbsp/ml.

@@ -64,7 +64,13 @@ test("persists a receipt and reports per-line outcomes", () => {
   assert.equal(summary.priceObservations, 2);
   assert.equal(summary.lines[0]?.confidence, "new");
 
-  assert.deepEqual(db.totals(), { receipts: 1, ingredients: 2, priceObservations: 2, recipes: 0 });
+  assert.deepEqual(db.totals(), {
+    receipts: 1,
+    ingredients: 2,
+    priceObservations: 2,
+    recipes: 0,
+    stores: 1,
+  });
   db.close();
 });
 
@@ -380,6 +386,79 @@ test("reviewed line and receipt flags can be resolved", () => {
   db.close();
 });
 
+test("receipt stores start unconfirmed and exact aliases reuse the same store", () => {
+  const db = freshDb();
+  const first = db.saveReceipt(
+    receipt([line("Chicken thighs", { unitPrice: 2.49 })], "Demo Market"),
+    "a.jpg",
+    "mock",
+  );
+  const second = db.saveReceipt(
+    receipt([line("Spinach", { unitPrice: 3.99 })], "  demo market! "),
+    "b.jpg",
+    "mock",
+  );
+
+  assert.equal(first.storeConfidence, "new");
+  assert.equal(first.newStores, 1);
+  assert.ok(first.storeId);
+  assert.equal(second.storeConfidence, "alias");
+  assert.equal(second.newStores, 0);
+  assert.equal(second.storeId, first.storeId);
+  assert.equal(db.totals().stores, 1);
+
+  const [store] = db.listUnconfirmedStores();
+  assert.equal(store?.canonicalName, "Demo Market");
+  assert.equal(store?.aliases, 1);
+  assert.equal(store?.receipts, 2);
+  db.confirmStore(store!.id);
+  assert.equal(db.listUnconfirmedStores().length, 0);
+  db.close();
+});
+
+test("null or invalid store text stays unmatched instead of minting a store", () => {
+  const db = freshDb();
+  const summary = db.saveReceipt(
+    { ...receipt([line("Spinach", { unitPrice: 3.99 })]), store: null },
+    "a.jpg",
+    "mock",
+  );
+
+  assert.equal(summary.storeId, null);
+  assert.equal(summary.storeConfidence, "unmatched");
+  assert.equal(summary.newStores, 0);
+  assert.equal(db.totals().stores, 0);
+  db.close();
+});
+
+test("merge folds a fragment store into another while preserving receipt links", () => {
+  const db = freshDb();
+  db.saveReceipt(receipt([line("Chicken thighs", { unitPrice: 2.49 })], "Walmart"), "a.jpg", "mock");
+  db.saveReceipt(receipt([line("Chicken thigh", { unitPrice: 2.59 })], "WAL-MART #1234"), "b.jpg", "mock");
+  assert.equal(db.totals().stores, 2);
+
+  const [frag, keep] = db.listUnconfirmedStores(); // newest first: WAL-MART #1234, Walmart
+  db.mergeStore(frag!.id, keep!.id);
+
+  const totals = db.totals();
+  assert.equal(totals.stores, 1);
+  assert.equal(totals.priceObservations, 2);
+  const [remaining] = db.listUnconfirmedStores();
+  assert.equal(remaining?.canonicalName, "Walmart");
+  assert.equal(remaining?.aliases, 2);
+  assert.equal(remaining?.receipts, 2);
+  db.close();
+});
+
+test("store merge rejects self-merge and unknown ids", () => {
+  const db = freshDb();
+  db.saveReceipt(receipt([line("Salt", { unitPrice: 1 })], "Test Mart"), "a.jpg", "mock");
+  const [only] = db.listUnconfirmedStores();
+  assert.throws(() => db.mergeStore(only!.id, only!.id), /itself/);
+  assert.throws(() => db.mergeStore(only!.id, 9999), /no store/);
+  db.close();
+});
+
 test("merge folds a fragment ingredient into another, preserving price history", () => {
   const db = freshDb();
   db.saveReceipt(receipt([line("Chicken thighs", { unitPrice: 2.49 })]), "a.jpg", "mock");
@@ -401,5 +480,100 @@ test("merge rejects self-merge and unknown ids", () => {
   const [only] = db.listUnconfirmedIngredients();
   assert.throws(() => db.mergeIngredient(only!.id, only!.id), /itself/);
   assert.throws(() => db.mergeIngredient(only!.id, 9999), /no ingredient/);
+  db.close();
+});
+
+// --- Nutrition ----------------------------------------------------------
+
+test("fresh databases seed a small reference food catalog", () => {
+  const db = freshDb();
+  const foods = db.listFoods();
+
+  assert.ok(foods.length >= 5);
+  assert.ok(foods.some((f) => f.description === "Chicken thighs, boneless skinless, raw"));
+  assert.ok(db.listFoods("spinach").some((f) => f.description === "Spinach, raw"));
+  db.close();
+});
+
+test("food links are proposed first and only confirmed links feed nutrition", () => {
+  const db = freshDb();
+  const recipeSummary = db.saveRecipe(
+    recipe([ingredientLine("Chicken thighs", { quantity: 1, unit: "lb" })]),
+    "r.jpg",
+    "mock",
+  );
+  const ingredientId = recipeSummary.lines[0]!.ingredientId!;
+  const chickenFood = db.listFoods("chicken")[0]!;
+
+  db.proposeIngredientFoodLink(ingredientId, chickenFood.id);
+  assert.equal(db.listProposedFoodLinks().length, 1);
+
+  const proposed = db.recipeNutrition(recipeSummary.recipeId);
+  assert.equal(proposed.nutrition.partial, true);
+  assert.equal(proposed.nutrition.total, null);
+  assert.match(proposed.nutrition.reasons.join("\n"), /awaiting confirmation/);
+
+  db.confirmIngredientFoodLink(ingredientId);
+  assert.equal(db.listProposedFoodLinks().length, 0);
+  const confirmed = db.recipeNutrition(recipeSummary.recipeId);
+  assert.equal(confirmed.nutrition.partial, false);
+  assert.equal(Math.round(confirmed.nutrition.total?.calories ?? 0), 649);
+  assert.equal(Math.round(confirmed.nutrition.perServing?.calories ?? 0), 162);
+  db.close();
+});
+
+test("review can list confirmed ingredients that still need food links", () => {
+  const db = freshDb();
+  db.saveRecipe(recipe([ingredientLine("Chicken thighs")]), "r.jpg", "mock");
+  const [ingredient] = db.listUnconfirmedIngredients();
+
+  assert.equal(db.listIngredientsMissingFoodLink().length, 0);
+  db.confirmIngredient(ingredient!.id);
+
+  const missing = db.listIngredientsMissingFoodLink();
+  assert.equal(missing.length, 1);
+  assert.equal(missing[0]?.canonicalName, "Chicken thighs");
+  db.close();
+});
+
+test("recipe nutrition reports partial conversion gaps and uses per-each hints", () => {
+  const db = freshDb();
+  const recipeSummary = db.saveRecipe(
+    recipe([ingredientLine("Garlic", { quantity: 2, unit: "cloves" })]),
+    "r.jpg",
+    "mock",
+  );
+  const ingredientId = recipeSummary.lines[0]!.ingredientId!;
+  const garlicFood = db.listFoods("garlic")[0]!;
+  db.proposeIngredientFoodLink(ingredientId, garlicFood.id);
+  db.confirmIngredientFoodLink(ingredientId);
+
+  const before = db.recipeNutrition(recipeSummary.recipeId);
+  assert.equal(before.nutrition.partial, true);
+  assert.match(before.nutrition.reasons.join("\n"), /cloves needs grams_per_each/);
+
+  db.setIngredientGramsPerEach(ingredientId, 3);
+  const after = db.recipeNutrition(recipeSummary.recipeId);
+  assert.equal(after.nutrition.partial, false);
+  assert.equal(Math.round(after.nutrition.total?.calories ?? 0), 9);
+  db.close();
+});
+
+test("merge preserves food links and conversion hints when the kept ingredient lacks them", () => {
+  const db = freshDb();
+  db.saveRecipe(recipe([ingredientLine("Garlic", { quantity: 2, unit: "cloves" })]), "a.jpg", "mock");
+  db.saveRecipe(recipe([ingredientLine("Garlic cloves", { quantity: 2, unit: "cloves" })]), "b.jpg", "mock");
+
+  const [from, into] = db.listUnconfirmedIngredients(); // newest first: Garlic cloves, Garlic
+  const garlicFood = db.listFoods("garlic")[0]!;
+  db.proposeIngredientFoodLink(from!.id, garlicFood.id);
+  db.confirmIngredientFoodLink(from!.id);
+  db.setIngredientGramsPerEach(from!.id, 3);
+
+  db.mergeIngredient(from!.id, into!.id);
+
+  const nutrition = db.recipeNutrition(2);
+  assert.equal(nutrition.nutrition.partial, false);
+  assert.equal(Math.round(nutrition.nutrition.total?.calories ?? 0), 9);
   db.close();
 });

@@ -7,9 +7,10 @@ Today this repo is a local TypeScript CLI app for proving the hardest data flows
 - Receipt photos -> structured line items -> SQLite price history.
 - Recipe photos -> structured ingredient lists -> SQLite recipe collection.
 - Both flows resolve to one canonical ingredient spine.
+- Receipt stores resolve to a canonical store spine for later cross-store price comparisons.
 - Human review keeps questionable data provisional instead of silently trusting it.
 
-There is no mobile app, server, auth, grocery-list UI, nutrition model, or pantry model yet.
+There is no mobile app, server, auth, grocery-list UI, meal-plan UI, or pantry model yet. Nutrition exists as a local CLI/discovery slice: seeded reference foods, gated ingredient→food links, and partial-honest recipe macro rollups.
 
 ## Current Slice
 
@@ -20,6 +21,7 @@ receipts/inbox/  -> process-receipts -> receipts + receipt_line_items + price_ob
 recipes/inbox/   -> process-recipes  -> recipe_ingests + recipes + recipe_ingredients
 
 both pipelines -> ingredients + ingredient_aliases
+receipt stores -> stores + store_aliases
 ```
 
 Capture is intentionally dumb: take photos on the phone and let Dropbox/iCloud/Drive sync them to an inbox folder. Processing happens later from the laptop. The synced folder is the queue.
@@ -55,8 +57,16 @@ For real OCR, add `ANTHROPIC_API_KEY` to `.env`. Mock commands do not need a key
 | `npm run review` | List unconfirmed ingredients, flagged lines, and unreconciled receipts. |
 | `npm run review -- confirm <id>` | Mark an ingredient as trusted. |
 | `npm run review -- merge <from> <into>` | Fold a duplicate/fragment ingredient into another. |
+| `npm run review -- confirm-store <id>` | Mark a canonical store as trusted. |
+| `npm run review -- merge-store <from> <into>` | Fold a duplicate/fragment store into another. |
 | `npm run review -- resolve-line <receipt\|recipe> <line-id>` | Clear a reviewed line flag. |
 | `npm run review -- resolve-receipt <id>` | Clear a reviewed receipt total warning. |
+| `npm run review -- foods [query]` | Search seeded reference foods for nutrition linking. |
+| `npm run review -- link-food <ingredient-id> <food-id>` | Propose an ingredient→food nutrition link. |
+| `npm run review -- confirm-food <ingredient-id>` | Confirm a proposed nutrition link so rollups can use it. |
+| `npm run review -- set-density <ingredient-id> <g-per-ml>` | Add a density hint for volume-to-grams conversion. |
+| `npm run review -- set-each-grams <ingredient-id> <grams>` | Add an each-weight hint for clove/each conversion. |
+| `npm run review -- nutrition [recipe-id]` | Show recipe macro rollups and partial reasons. |
 | `npm run db:reset` | Remove the default local SQLite database and sidecars. |
 | `npm run check` | Typecheck and run tests. |
 
@@ -97,6 +107,9 @@ The current design is deliberately conservative:
 - Bad line values are flagged, not dropped.
 - Invalid ingredient identities stay unlinked instead of minting garbage canonical ingredients.
 - Flagged prices never become `price_observations`.
+- Raw receipt store text is retained even when a canonical store link is merged.
+- Proposed nutrition links do not feed recipe macros until confirmed.
+- Unconvertible recipe units produce partial nutrition, not fabricated grams.
 
 SQLite data lands in `data/eatmodel.db`. Local data and image queues are gitignored.
 
@@ -109,7 +122,7 @@ iPhone photos are often HEIC/HEIF, which Claude vision does not accept directly.
 Example price-history query:
 
 ```sh
-sqlite3 data/eatmodel.db "SELECT canonical_name, store, observed_at, unit_price, unit FROM price_observations JOIN ingredients ON ingredients.id = price_observations.ingredient_id ORDER BY observed_at;"
+sqlite3 data/eatmodel.db "SELECT ingredients.canonical_name, stores.canonical_name AS canonical_store, price_observations.store AS raw_store, observed_at, unit_price, unit FROM price_observations JOIN ingredients ON ingredients.id = price_observations.ingredient_id LEFT JOIN stores ON stores.id = price_observations.store_id ORDER BY observed_at;"
 ```
 
 More inspection commands are in [docs/RUNBOOK.md](docs/RUNBOOK.md).
@@ -118,7 +131,7 @@ More inspection commands are in [docs/RUNBOOK.md](docs/RUNBOOK.md).
 
 ```
 src/
-  shared/   zod schemas, pricing, review checks, normalization
+  shared/   zod schemas, pricing, review checks, normalization, units, nutrition
   parser/   receipt/recipe parser interfaces plus LLM and mock implementations
   db/       SQLite repository and migration/constraint tests
   cli/      receipt/recipe processing, review commands, CLI integration tests
@@ -133,11 +146,11 @@ The folders mirror the likely future `packages/*` split. Keeping it as one TypeS
 
 ## Known Gaps
 
-- Store identity is still free text, so `Walmart`, `WAL-MART #1234`, and `WM SUPERCENTER` do not converge.
+- Store identity is exact-alias-or-create only; `Walmart`, `WAL-MART #1234`, and `WM SUPERCENTER` still need manual `merge-store` until fuzzy matching exists.
 - Ingredient matching is exact normalized alias matching only.
-- Unit conversion is not modeled yet.
+- Unit conversion is intentionally narrow: mass units work; volume/each need density or grams-per-each hints.
 - Recipe instructions are not captured yet.
 - Content-hash dedup cannot catch re-shot duplicate receipts or recipes.
 - Fresh databases have `CHECK` constraints, but existing SQLite tables are not rebuilt just to retrofit constraints.
 
-The next identity-focused slice should be a store spine for receipts.
+The next useful slice is a small reporting/query layer over confirmed ingredients, stores, food links, and prices.
