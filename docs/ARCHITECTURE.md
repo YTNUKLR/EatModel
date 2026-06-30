@@ -354,12 +354,43 @@ feed.
 
 ## 6. Nutrition data model
 
-`nutrition_per_100g` (per ingredient, all per 100 g unless noted):
-`calories, protein_g, carbs_g, fat_g, fiber_g, sugar_g, sodium_mg, …` (extend later).
-Start with the macro four (cal/protein/carb/fat); add micros when there's a reason.
+**Decision (2026-06-30): nutrition is a *referenced* attribute, not an inline column.** An earlier
+sketch put `nutrition_per_100g` directly on the `ingredient` row. That conflates two distinct
+identities: *"chicken thigh, boneless skinless"* (my canonical spine entry) versus *"USDA FDC #331960,
+chicken, broilers/fryers, thigh, meat only, raw"* (a reference food with its own facts). Nutrition is a
+property of the **reference food**, surfaced on the ingredient through a **link** — and that link is a
+human judgment, so it is gated exactly like ingredient and (coming) store identity.
 
-Cost-per-nutrient (the optimization hook) is a derived view:
-`PriceObservation.unit_price` + `nutrition_per_100g` ⇒ `$ / g protein`, `$ / 100 kcal`, etc., over time.
+Three pieces:
+
+**`foods` — reference catalog (read-only, seeded).**
+- `id`, `fdc_id` (stable external key into USDA FoodData Central), `description`, `source` (`usda_fdc` |
+  `manual`), `nutrition_per_100g`.
+- `nutrition_per_100g`: start with the **macro four** — `calories, protein_g, carbs_g, fat_g`; add
+  `fiber_g, sugar_g, sodium_mg, …` and micros when there's a reason.
+- This is **extraction, re-derivable** (§14 triage): seed a handful of common items now; backfill more
+  via the stable `fdc_id` later without re-deciding any links.
+
+**`ingredient.food_id` — the link (nullable FK), gated.**
+- Resolving a canonical ingredient to its reference food is the **make-or-break identity decision** of
+  this slice, symmetric to ingredient matching (§4.2 #1) and store identity (§14). It rides the **same
+  review gate (§5.5)**: a new link persists as provisional and is promoted via `confirm` — "is this the
+  right reference food for this ingredient?" is the same primitive as "is this the right canonical
+  ingredient for this line?" An unresolved ingredient keeps `food_id = null` and simply has no macros
+  yet — never a guessed match.
+
+**Rollup — pure, deterministic, `null`-honest.**
+The per-recipe / per-serving math (§5.3) lives in `shared/nutrition.ts`, TDD'd test-first like
+`shared/review.ts`. The hard part is **not** the food data — it's `qty,unit → grams` (§4.2 #2): a line
+of "1 cup" or "2 cloves" needs `density_g_per_ml` or a per-each weight we often lack. Per the
+no-silent-guessing rule, an unconvertible line yields a **`null` macro and marks the recipe rollup
+*partial*** (surfaced as `⚠ partial`) — never a fabricated number. Coverage improves as conversion
+data fills in; the app never blocks on it.
+
+Cost-per-nutrient (the optimization hook) is then a derived view, once price meets a confirmed link:
+`PriceObservation.unit_price` + `foods.nutrition_per_100g` ⇒ `$ / g protein`, `$ / 100 kcal`, over time.
+This is the bridge to the store-identity/price work — it wants *both* a food link and canonical stores,
+which is the sequencing argument for doing nutrition first (§7 Phase 2, §11).
 
 ---
 
@@ -398,8 +429,15 @@ Each phase should be independently useful. Don't build all six modules at once.
 - Add/edit recipes; ingredient matching on recipe entry.
 - Weekly plan; generate aggregated grocery list. *(No nutrition yet.)*
 
-**Phase 2 — Nutrition**
-- Seed reference nutrition; per-recipe and per-day macro rollups.
+**Phase 2 — Nutrition** *(next slice — spec'd 2026-06-30, §6)*
+- `foods` reference catalog (seed a handful of common USDA FDC items); gated `ingredient.food_id` link
+  on the §5.5 review gate; pure `shared/nutrition.ts` rollup with `null`-honest `partial` handling.
+- Per-recipe and per-serving macros surfaced in the `recipes` + `review` CLIs.
+- **Chosen ahead of store-identity** despite store-identity being the other open identity decision
+  (§14): nutrition has immediate user-visible payoff (macros on recipes already ingested) and
+  establishes the reference-link+gate pattern that makes store-identity a second instance of the same
+  shape. Store-identity has no payoff until the price/cost-per-nutrient views — which also want this
+  link — exist. (§11, 2026-06-30.)
 
 **Phase 3 — Receipts + price history (the differentiator)**
 - Camera capture → `LLMReceiptParser` → line items → `PriceObservation`.
@@ -473,6 +511,17 @@ Each phase should be independently useful. Don't build all six modules at once.
 - **2026-06-29** — **Review / confidence gate** (§5.5) built (closes review findings #3 + #5). New ingredients persist as `status='unconfirmed'` and are promoted via `confirmIngredient` or de-fragmented via `mergeIngredient` (the concrete remedy for exact-match fragmentation until Phase 3 fuzzy matching). Boundary validation **flags, never drops**: untrustworthy lines get a `needs_review` reason and are excluded from price observations, but still stored (one bad line can't sink a receipt). Invalid identities stay unlinked instead of minting garbage canonical ingredients. Receipts get a cheap **total reconciliation** (lines exceeding the total, or far below it, flag the receipt). Surfaced via `⚠ review` in the ingest CLIs and a `npm run review` CLI (list / confirm / merge / resolve-line / resolve-receipt). Validation logic is pure + tested in `shared/review.ts`.
 - **2026-06-29** — **Baby-app hardening pass:** fresh SQLite databases now include `CHECK` constraints for hard invariants (review booleans, ingredient status, match confidence, positive recipe ingest counts, non-negative persisted price facts). The process scripts export callable `processReceipts` / `processRecipes` functions behind CLI main guards, enabling integration tests over temp inbox/processed/db paths without invoking the network or mutating real data.
 - **2026-06-29** — **Guiding principle for "handle it now vs later":** because every ingest **retains the original image + `raw_json`**, almost any *extraction* gap (units, fractions, sub-sections, discounts) is re-derivable by re-parsing and can be safely deferred. What's *not* cheaply reversible is **identity and accumulated human judgment** (how lines resolve to the spine; confirmations) — so those get handled now (the gate), and the rest is logged as backlog (§14).
+- **2026-06-30** — **Nutrition chosen as the next slice (§6, §7 Phase 2).** Nutrition is modeled as a
+  *referenced* attribute, not an inline `ingredient` column: a read-only `foods` reference catalog
+  (seeded from USDA FDC, keyed by `fdc_id`) + a **gated `ingredient.food_id` link** on the existing
+  §5.5 review gate, + a pure `shared/nutrition.ts` rollup. Rationale split by the §14 triage rule — the
+  *link* is accumulated judgment (handle now, gate it), the *food catalog* is re-derivable extraction
+  (seed small, backfill later). The real risk is `qty,unit → grams` conversion (§4.2 #2), not the food
+  data; unconvertible lines mark a recipe **`partial`** rather than fabricating macros (no-silent-
+  guessing). **Sequenced ahead of store identity** (still open, §14): nutrition has immediate
+  user-visible payoff and establishes the reference-link+gate pattern that makes store identity a second
+  instance of the same shape — whereas store identity has no payoff until the cost-per-nutrient views,
+  which themselves want this link, exist.
 
 ---
 
@@ -531,6 +580,16 @@ the principle in the §11 log (2026-06-29): **we retain the original image + `ra
 ingest, so most _extraction_ gaps can be re-derived later by re-parsing** — those are safe to defer.
 What gets pulled forward is anything touching **identity** (the spine) or **accumulated judgment**,
 because that's expensive to unwind once data piles up.
+
+**Next slice chosen — nutrition (§6, §7 Phase 2):**
+- **Nutrition link is an identity decision → handled now; the food DB is extraction → deferred.**
+  Resolving a canonical ingredient to a reference food (`ingredient.food_id`) is accumulated human
+  judgment and rides the §5.5 gate; the `foods` catalog itself is re-derivable reference data, so only
+  a small seed is built now and backfilled later via stable `fdc_id`. The pure rollup
+  (`shared/nutrition.ts`) is `null`-honest: unconvertible units (the real risk, §4.2 #2) mark a recipe
+  `partial` rather than fabricating macros. Sequenced **ahead of store identity** (which remains the
+  other open decision below) for user-visible payoff + because it establishes the reference-link+gate
+  pattern store-identity will reuse. (See §11 log entry 2026-06-30 in §6/§7.)
 
 **Next identity decision (do before it accumulates):**
 - **Store identity for receipts.** `receipts.store` is free text today — `WAL-MART #1234` / `Walmart` /
