@@ -43,12 +43,19 @@ spine (the thing the whole app depends on). **Write the failing test first, then
 The db repository gets tested against a throwaway SQLite file (or `:memory:`), asserting behavior:
 alias reuse doesn't duplicate ingredients, price observations accrue, a failed line rolls back.
 
-**The LLM parser — an eval, not a unit test. [now-ish; needs real receipts]**
-`LLMReceiptParser` output isn't deterministic, so it can't be unit-asserted. Treat it as an eval:
-- Keep a `fixtures/` set of **real receipt images + hand-checked expected extractions.**
-- A script runs the parser over them and reports diffs (fields missed, wrong prices, hallucinated lines).
-- Run it whenever the prompt or model changes. Pin the model id; we already store `raw_json` of every
-  parse and keep the original images, so any regression is reproducible.
+**The LLM parser — an eval, not a unit test. [built — receipts]**
+`LLMReceiptParser` output isn't deterministic, so it can't be unit-asserted. It's an eval instead:
+- **Fixtures** live in `fixtures/receipts/` as `<name>.<img>` + `<name>.expected.json` (hand-checked)
+  pairs. Real receipts are private, so **both images and expected JSON are gitignored** (`fixtures/README.md`).
+- **`npm run eval`** runs the real parser over them; **`npm run eval:mock`** runs the same harness with
+  the canned parser (no key). It reports per-fixture and aggregate **recall** (real lines captured),
+  **precision** (lines not invented), and **field accuracy** (right values on matched lines), prints the
+  specific gaps, and exits non-zero below `EATMODEL_EVAL_MIN` (default 0.9).
+- **Same pure/IO split as the rest of the codebase:** scoring is pure + TDD'd in `shared/eval.ts`
+  (line-level vs field-level misses kept distinct); the harness `cli/eval-receipts.ts` owns the parser
+  call and is plumbing-tested with the mock over a temp dir — so the suite stays green with no fixtures present.
+- Run it whenever the prompt or model changes. Pin the model id; we keep `raw_json` + the original
+  images, so any regression is reproducible. *(Recipe eval is the symmetric follow-up — not yet built.)*
 
 **Gates. [now]** `npm test` runs the suite; `npm run check` = typecheck + tests. Green before merge.
 Coverage thresholds / mutation testing: **[later]**.

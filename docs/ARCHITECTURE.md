@@ -615,6 +615,17 @@ Each phase should be independently useful. Don't build all six modules at once.
   `confirm-store` / `merge-store`. Raw `receipts.store` and `price_observations.store` stay unchanged
   for audit/reparse, while canonical comparisons can use `store_id`. Existing receipts are backfilled
   into unconfirmed canonical stores on migration.
+- **2026-06-30** — **Parser eval harness built (receipts).** Closes the standing gap from
+  `CONVENTIONS §2`: the riskiest subsystem (vision parsers) had no regression signal. `npm run eval`
+  (`eval:mock` for keyless) scores the parser against hand-checked `fixtures/receipts/*.expected.json`
+  and reports **recall** (real lines captured), **precision** (lines not invented), and **field
+  accuracy** (right values on matched lines), exiting non-zero below `EATMODEL_EVAL_MIN` (default 0.9).
+  Built to the codebase's own pure/IO split — scoring is pure + TDD'd in `shared/eval.ts` (line-level
+  vs field-level misses scored separately so a price slip and a dropped line don't blur together);
+  `cli/eval-receipts.ts` owns the parser call and is plumbing-tested with the mock over a temp dir, so
+  the suite stays green with zero fixtures. **Fixtures are private** — real images *and* expected JSON
+  are gitignored (`fixtures/README.md`). Recipe eval is the symmetric follow-up (scorer generalizes;
+  recipe lines need their own field checks).
 - **2026-06-30** — **Resolution seam extracted (§4.3 realized).** With store identity landed,
   `matchStore` and `matchIngredient` were line-for-line duplicates of the *normalize → exact-alias →
   else mint canonical + alias* mechanic. Factored into one private `Db.resolveCanonical(rawText, source,
@@ -673,13 +684,12 @@ Deliberate simplifications in the first slice — recorded so they aren't mistak
 - **Recipe steps are not captured (ingredients-list-first).** v1 extracts title/source/servings/
   ingredients only. The original image and `raw_json` are retained, so instructions can be re-parsed
   later without re-photographing.
-- **No parser eval harness yet — only the intention of one.** `CONVENTIONS.md §2` specifies a
-  `fixtures/` set of real images + hand-checked extractions and a script that reports extraction diffs
-  when the prompt/model changes. Neither the `fixtures/` set nor the runner exists. For the *riskiest*
-  part of the system (the two vision parsers), there is currently no regression signal — a prompt tweak
-  or model bump could silently degrade extraction and nothing would catch it. Cheap to start (we already
-  retain every image + `raw_json`, so fixtures are free to collect); worth standing up before the
-  parsers are trusted for anything cost- or macro-quantitative. Tracked in §14.
+- **Parser eval harness — built for receipts (2026-06-30); recipes still to do.** `npm run eval` scores
+  the receipt parser against hand-checked `fixtures/receipts/*.expected.json` and reports recall /
+  precision / field accuracy with the specific gaps; pure scoring in `shared/eval.ts`, harness in
+  `cli/eval-receipts.ts` (`§11`). The *recipe* parser still has no eval — same risk applies to it until
+  the symmetric harness lands (the scorer generalizes; recipe lines carry `prepNote`/`optional`/no price
+  instead of price, so it needs its own field checks).
 
 ---
 
@@ -732,4 +742,4 @@ because that's expensive to unwind once data piles up.
 | Receipts | `unitPrice` falls back to `lineTotal` when quantity is absent (whole-package price as per-unit) | Fine for trend-spotting; revisit before serious cost-per-unit math. |
 | Both | Cross-photo duplicate (same recipe/receipt re-shot → different hash, not deduped) | Content-hash can't catch it; title/line similarity is a later nicety. |
 | Recipes | Steps/instructions not captured (ingredients-list-first) | Original image retained; re-parse when the cooking/preservation phase lands. |
-| Quality | **Parser eval harness** (`fixtures/` + diff runner per `CONVENTIONS §2`) not built | Retained images + `raw_json` mean fixtures are free to backfill; stand up before the parsers are trusted for quantitative cost/macro math (§12). |
+| Quality | **Recipe** parser eval harness (receipt eval shipped 2026-06-30; recipe one is the symmetric follow-up) | Scorer in `shared/eval.ts` generalizes; recipe lines need their own field checks (prepNote/optional, no price). Retained images + `raw_json` mean fixtures are free to backfill. |

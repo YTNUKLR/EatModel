@@ -67,6 +67,8 @@ For real OCR, add `ANTHROPIC_API_KEY` to `.env`. Mock commands do not need a key
 | `npm run review -- set-density <ingredient-id> <g-per-ml>` | Add a density hint for volume-to-grams conversion. |
 | `npm run review -- set-each-grams <ingredient-id> <grams>` | Add an each-weight hint for clove/each conversion. |
 | `npm run review -- nutrition [recipe-id]` | Show recipe macro rollups and partial reasons. |
+| `npm run eval` | Score the receipt parser against `fixtures/receipts/` (recall/precision/field accuracy). |
+| `npm run eval:mock` | Run the eval harness with the canned parser (no API key). |
 | `npm run db:reset` | Remove the default local SQLite database and sidecars. |
 | `npm run check` | Typecheck and run tests. |
 

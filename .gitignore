@@ -12,3 +12,14 @@ recipes/failed/
 !recipes/processed/.gitkeep
 .env
 *.log
+
+# Eval fixtures hold real receipt/recipe images AND their hand-checked expected
+# extractions — both are private. Keep the structure + docs, ignore the data.
+fixtures/**/*.jpg
+fixtures/**/*.jpeg
+fixtures/**/*.png
+fixtures/**/*.gif
+fixtures/**/*.webp
+fixtures/**/*.heic
+fixtures/**/*.heif
+fixtures/**/*.expected.json

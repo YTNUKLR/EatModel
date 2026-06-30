@@ -13,6 +13,8 @@
     "recipes": "tsx src/cli/process-recipes.ts",
     "recipes:mock": "EATMODEL_RECIPE_PARSER=mock tsx src/cli/process-recipes.ts",
     "review": "tsx src/cli/review.ts",
+    "eval": "tsx src/cli/eval-receipts.ts",
+    "eval:mock": "EATMODEL_PARSER=mock tsx src/cli/eval-receipts.ts",
     "test": "node --import tsx --test \"src/**/*.test.ts\"",
     "check": "tsc --noEmit && npm test",
     "db:reset": "rm -f data/eatmodel.db data/eatmodel.db-wal data/eatmodel.db-shm"
