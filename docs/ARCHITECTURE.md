@@ -82,6 +82,21 @@ the spine of the system:
 Get the spine right and nutrition, cost, and inventory all compose for free. Get it wrong and you
 have six disconnected apps sharing a login.
 
+**The payoff is the emergent cross-module queries, not the modules.** The roadmap (§7) builds
+module-by-module, but the reason the spine exists is the questions only it can answer — these are the
+north-star demos to steer toward, each one a join no single-purpose app can do:
+
+- **"What can I cook *right now*?"** — pantry/freezer stock ∩ recipe requirements → cookable recipes,
+  ranked by *fewest missing ingredients* (and what to buy to unlock the next N).
+- **"Cheapest way to cook this week's plan."** — plan → grocery list → `price_observations` per
+  ingredient per store → cheapest basket (needs the store-identity spine, §14).
+- **"Most protein per dollar I can actually stand to eat."** — `foods` macros + price, *filtered by the
+  variety/enjoyment constraints* so it doesn't recommend gruel (§1 enjoyment goal).
+- **"Use-it-or-lose-it."** — pantry `use_by` ∩ recipes that consume those items → suggested cooks.
+
+Each becomes answerable the moment its inputs share the spine; none requires a new module, only the
+links already being built. Listing them here so a slice can be judged by *which query it lights up*.
+
 ---
 
 ## 2. Goals & non-goals
@@ -239,9 +254,59 @@ This is the most important section. Names are indicative; exact columns evolve i
 
 1. **Ingredient matching** (recipe text + receipt text → canonical ingredient). Strategy: exact alias
    match → fuzzy/embedding match → LLM fallback → human confirm. Every confirmed match writes a new
-   `IngredientAlias`, so the system gets smarter over time. **This is the make-or-break subsystem.**
+   `IngredientAlias`, so the system gets smarter over time. **This is the make-or-break subsystem** —
+   and it is one instance of a more general primitive (see **§4.3**).
 2. **Unit conversion** (cups ↔ grams ↔ "each"). Needs density + per-item weights. Lives in
-   `packages/shared` as pure, tested functions. When conversion is impossible, the UI asks rather than guesses.
+   `packages/shared` as pure, tested functions. When conversion is impossible, the UI asks rather than
+   guesses. **Make-or-break for nutrition and cost math, and almost entirely unbuilt** (`shared/units.ts`
+   is currently just `normalizeName`). Design sketch:
+   - **Three conversion classes, in order of reliability:** (a) *mass↔mass* and *volume↔volume* are
+     pure ratios, always known; (b) *volume↔mass* needs `ingredient.density_g_per_ml`; (c) *count↔mass*
+     ("2 cloves", "1 can") needs a per-each weight, which is **per-ingredient, not universal** — store
+     it on the ingredient (e.g. `grams_per_each`, nullable).
+   - **Density/per-each data is reference data → seed small, backfill later** (same triage as `foods`):
+     ship a handful of common items, source the rest from USDA FDC portion data or accumulate from
+     confirmed conversions over time.
+   - **No-silent-guessing is the hard contract:** the function returns `grams | null`, never a
+     fabricated number. A `null` propagates up as a `partial` rollup (§6) and, in the app, becomes an
+     "what does 1 clove of garlic weigh?" prompt whose answer is *stored on the ingredient* — so the
+     same gap is asked once, then never again (the §4.3 learning loop, applied to units).
+   - Tagged-union result (`{ ok, grams }` | `{ ok: false, reason }`) over throwing, so callers must
+     handle the gap. Pure + exhaustively tested, test-first.
+
+### 4.3 One primitive under all of it: the resolution gate
+
+The single most reusable idea in the system, currently implemented ad hoc per feature. **Ingredient
+matching (§4.2 #1), nutrition food-linking (§6), store identity (§14), and cross-source dedup are not
+four features — they are four instances of one primitive:** *resolve a messy token to a canonical
+entity, stage the link as provisional, let a human confirm or merge, and feed every confirmation back
+so the resolver gets smarter.*
+
+```
+  raw token ──▶ candidate generation ──▶ confidence score ──▶ gate ──▶ confirmed edge
+  ("GV CHKN")   (alias/fuzzy/LLM/        (auto-accept high,    (§5.5   (writes an alias /
+                 catalog lookup)          stage the rest)       review)  link that teaches
+                                                                         the next lookup) ◀─┐
+                                                                                            │
+                            every confirmation widens what auto-resolves next time ─────────┘
+```
+
+Each instance varies only in three slots:
+| Instance | token | candidate source | confirmed edge written |
+|---|---|---|---|
+| Ingredient match | recipe/receipt line text | `ingredient_aliases` → fuzzy → LLM | new `IngredientAlias` |
+| Food link (§6) | a canonical ingredient | `foods` catalog (USDA FDC) | `ingredient.food_id` |
+| Store identity (§14) | `receipts.store` free text | canonical `stores` → fuzzy | store alias |
+| Unit gap (§4.2 #2) | "1 clove" on an ingredient | human answer | `grams_per_each` on the ingredient |
+
+The **review gate (§5.5)** is already the shared *back half* (stage → confirm/merge). What's not yet
+factored out is the *front half* (candidate generation + confidence + the alias/edge that closes the
+learning loop). **Implication for sequencing:** when nutrition builds the food-link, build it against
+this shape — a small `resolve(token, candidates) → {status, edge}` seam — rather than a bespoke
+nutrition-only path, so store identity and auto ingredient-matching later drop in as the *same* seam
+with different slots filled. (Deliberately *not* over-abstracting now: extract the seam when the
+*second* instance lands, which is the food-link — that's the moment the duplication is real, not
+hypothetical.)
 
 ---
 
@@ -522,6 +587,17 @@ Each phase should be independently useful. Don't build all six modules at once.
   user-visible payoff and establishes the reference-link+gate pattern that makes store identity a second
   instance of the same shape — whereas store identity has no payoff until the cost-per-nutrient views,
   which themselves want this link, exist.
+- **2026-06-30** — **Documented four latent design ideas that existed only in discussion**, to close the
+  gap between how well *decisions* were recorded and how poorly some *generative* ideas were: (1) **§4.3
+  the resolution gate** — ingredient-matching, food-linking, store-identity, and unit gaps are one
+  primitive (token → candidates → confidence → gate → confirmed edge that teaches the next lookup);
+  factor the seam out when the food-link (the second instance) lands, not before. (2) **§4.2 #2 expanded**
+  into an actual conversion-engine sketch (three reliability classes, per-each weight on the ingredient,
+  `grams | null` no-guess contract) — flagged that the "make-or-break" lib is still essentially unbuilt.
+  (3) **§1 emergent-query north-stars** — the spine is justified by cross-module joins ("what can I cook
+  now," cheapest-basket, protein-per-$ within variety), so slices can be judged by which query they light
+  up. (4) **§12/§14 eval-harness gap** — `CONVENTIONS §2` specifies a parser eval; none exists, leaving
+  the riskiest subsystem with no regression signal. No code; these steer the upcoming nutrition slice.
 
 ---
 
@@ -552,6 +628,13 @@ Deliberate simplifications in the first slice — recorded so they aren't mistak
 - **Recipe steps are not captured (ingredients-list-first).** v1 extracts title/source/servings/
   ingredients only. The original image and `raw_json` are retained, so instructions can be re-parsed
   later without re-photographing.
+- **No parser eval harness yet — only the intention of one.** `CONVENTIONS.md §2` specifies a
+  `fixtures/` set of real images + hand-checked extractions and a script that reports extraction diffs
+  when the prompt/model changes. Neither the `fixtures/` set nor the runner exists. For the *riskiest*
+  part of the system (the two vision parsers), there is currently no regression signal — a prompt tweak
+  or model bump could silently degrade extraction and nothing would catch it. Cheap to start (we already
+  retain every image + `raw_json`, so fixtures are free to collect); worth standing up before the
+  parsers are trusted for anything cost- or macro-quantitative. Tracked in §14.
 
 ---
 
@@ -608,3 +691,4 @@ because that's expensive to unwind once data piles up.
 | Receipts | `unitPrice` falls back to `lineTotal` when quantity is absent (whole-package price as per-unit) | Fine for trend-spotting; revisit before serious cost-per-unit math. |
 | Both | Cross-photo duplicate (same recipe/receipt re-shot → different hash, not deduped) | Content-hash can't catch it; title/line similarity is a later nicety. |
 | Recipes | Steps/instructions not captured (ingredients-list-first) | Original image retained; re-parse when the cooking/preservation phase lands. |
+| Quality | **Parser eval harness** (`fixtures/` + diff runner per `CONVENTIONS §2`) not built | Retained images + `raw_json` mean fixtures are free to backfill; stand up before the parsers are trusted for quantitative cost/macro math (§12). |
