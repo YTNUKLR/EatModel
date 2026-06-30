@@ -306,14 +306,20 @@ Each instance varies only in three slots:
 | Store identity (§14) | `receipts.store` free text | canonical `stores` → fuzzy | store alias |
 | Unit gap (§4.2 #2) | "1 clove" on an ingredient | human answer | `grams_per_each` on the ingredient |
 
-The **review gate (§5.5)** is already the shared *back half* (stage → confirm/merge). What's not yet
-factored out is the *front half* (candidate generation + confidence + the alias/edge that closes the
-learning loop). **Implication for sequencing:** when nutrition builds the food-link, build it against
-this shape — a small `resolve(token, candidates) → {status, edge}` seam — rather than a bespoke
-nutrition-only path, so store identity and auto ingredient-matching later drop in as the *same* seam
-with different slots filled. (Deliberately *not* over-abstracting now: extract the seam when the
-*second* instance lands, which is the food-link — that's the moment the duplication is real, not
-hypothetical.)
+The **review gate (§5.5)** is already the shared *back half* (stage → confirm/merge).
+
+**The *alias-or-create* front half is now factored out too** *(2026-06-30)*. Of the four rows above,
+two share the exact same mechanic — *normalize → exact-alias lookup → else mint canonical + first
+alias* — and those are **ingredient matching and store identity**. Once store identity landed they were
+line-for-line duplicates, so the shape moved into one private `Db.resolveCanonical(rawText, source,
+spec)` seam, with `matchIngredient`/`matchStore` reduced to a `ResolutionSpec` (table/column names) plus
+their own input guards (store text may be blank; ingredient text isn't). Fuzzy/embedding candidate
+generation, when it arrives, slots in once — between the alias lookup and the insert — and lights up
+both spines together. (The other two rows are *related but not this seam*: the **food link** is a
+catalog lookup + gated edge, not alias-create, so it reuses the §5.5 gate but resolves against `foods`;
+the **unit gap** is a one-shot human answer stored on the ingredient. The earlier note here guessed the
+food-link would be the trigger for extraction — wrong: it was the *store* spine, because that's what
+actually duplicated the alias-create mechanic.)
 
 ---
 
@@ -609,6 +615,15 @@ Each phase should be independently useful. Don't build all six modules at once.
   `confirm-store` / `merge-store`. Raw `receipts.store` and `price_observations.store` stay unchanged
   for audit/reparse, while canonical comparisons can use `store_id`. Existing receipts are backfilled
   into unconfirmed canonical stores on migration.
+- **2026-06-30** — **Resolution seam extracted (§4.3 realized).** With store identity landed,
+  `matchStore` and `matchIngredient` were line-for-line duplicates of the *normalize → exact-alias →
+  else mint canonical + alias* mechanic. Factored into one private `Db.resolveCanonical(rawText, source,
+  spec)` parameterized by a `ResolutionSpec` (table/column names — fixed internal identifiers, safe to
+  interpolate); the two `match*` methods are now thin wrappers carrying their own input guards. No
+  behavior change (all 78 tests green). Pays off when fuzzy matching arrives: it slots into the one seam
+  and lights up both spines at once. Corrected the §4.3 prediction (it expected the *food-link* to
+  trigger extraction; the actual duplicate was the *store* spine — the food-link is a distinct
+  catalog-lookup shape that reuses only the §5.5 gate).
 - **2026-06-30** — **Partial nutrition is shown as a floor, not a fact (review finding).** A recipe
   with some uncounted lines (no confirmed link / unconvertible unit) still has a real `total`/`perServing`
   from the lines that *did* count — but printed bare it reads as authoritative while silently omitting

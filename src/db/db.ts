@@ -242,6 +242,36 @@ CREATE TABLE IF NOT EXISTS recipe_ingredients (
 
 export type MatchConfidence = "alias" | "new";
 
+/**
+ * One resolution primitive underlies ingredient-matching and store-identity
+ * (and, later, anything else that resolves messy text to a canonical entity):
+ * normalize → exact-alias lookup → else mint a canonical row + its first alias.
+ * The only per-domain differences are the table/column names captured here, so
+ * the shape lives in one place instead of being copy-pasted per spine.
+ * (See ARCHITECTURE §4.3.) Fuzzy/embedding candidate generation, when it lands,
+ * slots in between the alias lookup and the insert — for every domain at once.
+ *
+ * `canonicalTable`/`aliasTable`/`fk` are fixed internal identifiers, never user
+ * input, so interpolating them into SQL is safe.
+ */
+interface ResolutionSpec {
+  canonicalTable: string;
+  aliasTable: string;
+  fk: string;
+}
+
+const INGREDIENT_RESOLUTION: ResolutionSpec = {
+  canonicalTable: "ingredients",
+  aliasTable: "ingredient_aliases",
+  fk: "ingredient_id",
+};
+
+const STORE_RESOLUTION: ResolutionSpec = {
+  canonicalTable: "stores",
+  aliasTable: "store_aliases",
+  fk: "store_id",
+};
+
 export interface LineOutcome {
   description: string;
   ingredientId: number | null;
@@ -568,26 +598,42 @@ export class Db {
    * ("new") so the catalog and price history accrue automatically. Every match
    * therefore teaches the system a new alias — the matcher gets smarter over time.
    */
+  /**
+   * Resolve raw text to a canonical entity per `spec`: exact normalized-alias
+   * match, else mint a canonical row + its first alias. The single shared seam
+   * behind `matchIngredient`/`matchStore` (ARCHITECTURE §4.3). Callers that
+   * accept empty/absent input must guard before calling — a blank token here
+   * would mint a junk canonical row.
+   */
+  private resolveCanonical(
+    rawText: string,
+    source: "receipt" | "recipe" | "manual",
+    spec: ResolutionSpec,
+  ): { id: number; confidence: MatchConfidence } {
+    const normalized = normalizeName(rawText);
+    const existing = this.db
+      .prepare(`SELECT ${spec.fk} AS id FROM ${spec.aliasTable} WHERE normalized = ?`)
+      .get(normalized) as { id: number } | undefined;
+    if (existing) return { id: existing.id, confidence: "alias" };
+
+    const inserted = this.db
+      .prepare(`INSERT INTO ${spec.canonicalTable} (canonical_name) VALUES (?)`)
+      .run(rawText.trim());
+    const id = Number(inserted.lastInsertRowid);
+    this.db
+      .prepare(
+        `INSERT INTO ${spec.aliasTable} (${spec.fk}, alias_text, normalized, source) VALUES (?, ?, ?, ?)`,
+      )
+      .run(id, rawText.trim(), normalized, source);
+    return { id, confidence: "new" };
+  }
+
   private matchIngredient(
     description: string,
     source: "receipt" | "recipe",
   ): { ingredientId: number; confidence: MatchConfidence } {
-    const normalized = normalizeName(description);
-    const existing = this.db
-      .prepare("SELECT ingredient_id AS id FROM ingredient_aliases WHERE normalized = ?")
-      .get(normalized) as { id: number } | undefined;
-    if (existing) return { ingredientId: existing.id, confidence: "alias" };
-
-    const ing = this.db
-      .prepare("INSERT INTO ingredients (canonical_name) VALUES (?)")
-      .run(description.trim());
-    const ingredientId = Number(ing.lastInsertRowid);
-    this.db
-      .prepare(
-        "INSERT INTO ingredient_aliases (ingredient_id, alias_text, normalized, source) VALUES (?, ?, ?, ?)",
-      )
-      .run(ingredientId, description.trim(), normalized, source);
-    return { ingredientId, confidence: "new" };
+    const { id, confidence } = this.resolveCanonical(description, source, INGREDIENT_RESOLUTION);
+    return { ingredientId: id, confidence };
   }
 
   /**
@@ -596,25 +642,13 @@ export class Db {
    * start unconfirmed and can later be confirmed or merged.
    */
   private matchStore(store: string | null): { storeId: number | null; confidence: MatchConfidence | "unmatched" } {
+    // Unlike ingredients, store text is often absent/blank — guard so a missing
+    // store stays unmatched rather than minting an empty canonical store.
     if (store == null || store.trim() === "" || normalizeName(store) === "") {
       return { storeId: null, confidence: "unmatched" };
     }
-    const normalized = normalizeName(store);
-    const existing = this.db
-      .prepare("SELECT store_id AS id FROM store_aliases WHERE normalized = ?")
-      .get(normalized) as { id: number } | undefined;
-    if (existing) return { storeId: existing.id, confidence: "alias" };
-
-    const inserted = this.db
-      .prepare("INSERT INTO stores (canonical_name) VALUES (?)")
-      .run(store.trim());
-    const storeId = Number(inserted.lastInsertRowid);
-    this.db
-      .prepare(
-        "INSERT INTO store_aliases (store_id, alias_text, normalized, source) VALUES (?, ?, ?, 'receipt')",
-      )
-      .run(storeId, store.trim(), normalized);
-    return { storeId, confidence: "new" };
+    const { id, confidence } = this.resolveCanonical(store, "receipt", STORE_RESOLUTION);
+    return { storeId: id, confidence };
   }
 
   /** True if a receipt with this image content hash has already been ingested. */
