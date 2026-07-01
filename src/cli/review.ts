@@ -13,6 +13,8 @@ const USAGE = `Review gate — inspect and resolve what the ingest flagged.
   npm run review -- confirm <id>  mark ingredient <id> as confirmed (trusted spine)
   npm run review -- merge <from> <into>
                                   fold ingredient <from> into <into> (de-fragment the spine)
+  npm run review -- delete-recipe <id>
+                                  delete a mis-captured recipe + the ingredients it orphans
   npm run review -- confirm-store <id>
                                   mark store <id> as confirmed
   npm run review -- merge-store <from> <into>
@@ -156,6 +158,18 @@ function main(): void {
       const into = intArg(rest[1], "<into> id");
       db.mergeIngredient(from, into);
       console.log(`✓ merged ingredient #${from} into #${into}`);
+    } else if (cmd === "delete-recipe") {
+      const id = intArg(rest[0], "recipe id");
+      const summary = db.deleteRecipe(id);
+      const title = summary.title ?? "(untitled recipe)";
+      console.log(`✓ deleted recipe #${id}  ${title}`);
+      if (summary.deletedIngredientIds.length) {
+        console.log(
+          `  removed ${summary.deletedIngredientIds.length} orphaned ingredient(s): ` +
+            summary.deletedIngredientIds.map((i) => `#${i}`).join(", "),
+        );
+      }
+      if (summary.deletedIngest) console.log(`  removed the now-empty image ingest`);
     } else if (cmd === "confirm-store") {
       const id = intArg(rest[0], "store id");
       db.confirmStore(id);

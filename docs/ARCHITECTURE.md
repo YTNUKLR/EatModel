@@ -626,6 +626,18 @@ Each phase should be independently useful. Don't build all six modules at once.
   the suite stays green with zero fixtures. **Fixtures are private** — real images *and* expected JSON
   are gitignored (`fixtures/README.md`). Recipe eval is the symmetric follow-up (scorer generalizes;
   recipe lines need their own field checks).
+- **2026-06-30** — **`review -- delete-recipe <id>` added.** Multi-recipe photos and partial re-shots
+  (a second attempt at the tail of a recipe) mis-parse into junk recipes that need removal — previously
+  only doable via hand-written SQL, which is easy to get wrong (orphaned ingredients, aliases, and empty
+  ingests left behind, or an FK-order slip). The command deletes the recipe + its lines, the ingredients
+  it **orphans** (plus their aliases), and the `recipe_ingests` row if it was the image's last recipe.
+  The orphan *decision* is pure + TDD'd in `shared/review.ts` (`planRecipeDeletion`): an ingredient is
+  removed only if no **other** recipe/receipt/price fact references it — and a **confirmed** ingredient is
+  never deleted, because confirmation is accumulated human judgment that must outlive the recipe that
+  introduced it (§5.5 principle). A surviving ingest's `raw_json`/`recipe_count` are left as parse-time
+  provenance (consistent with the retained original), so they can still disagree with the live recipe
+  rows by design. All in one transaction. **No undo** beyond restoring a db backup — deletion is the one
+  irreversible review action, versus confirm/merge which are reshapeable.
 - **2026-06-30** — **Resolution seam extracted (§4.3 realized).** With store identity landed,
   `matchStore` and `matchIngredient` were line-for-line duplicates of the *normalize → exact-alias →
   else mint canonical + alias* mechanic. Factored into one private `Db.resolveCanonical(rawText, source,
@@ -729,7 +741,7 @@ because that's expensive to unwind once data piles up.
 **Next useful build:**
 - **Reporting/query layer.** The data now has the joins needed for "price history by canonical store,"
   "recipe macros," and eventually "$/g protein." Build small read-only reports before adding more
-  ingestion surface area.
+  ingestion surface area. **Full plan: §15.**
 
 **Deferred — retro-fixable from the retained image/JSON:**
 
@@ -753,3 +765,106 @@ because that's expensive to unwind once data piles up.
 | db | `listRecipeNutrition` is N+1 (one `recipeNutrition` query per recipe) | Fine for a household's recipe count; fold into a single join if it ever matters. |
 | Nutrition | `foods` seeds are labelled `source:'manual'` though clearly USDA-derived (no `fdc_id` recorded) | Honest as-is; the real FDC import (above) replaces them with `fdc_id`-keyed rows. |
 | Store match | `matchStore`/`matchIngredient` are still **exact-normalized-alias-only** — `WAL-MART #1234` ≠ `Walmart` will fragment | Same limitation as ingredients; `merge-store`/`merge` are the manual remedy until fuzzy matching slots into `resolveCanonical` (§4.3). |
+
+---
+
+## 15. Report slice plan (next build) — read-only query layer
+
+Status: **planned, not built** (2026-06-30). This is the "Next useful build" from §14. It's chosen over
+every other backlog item because it's the first slice that turns the accumulated spine into user-visible
+payoff (store identity has produced *zero* payoff until a cost view consumes it — §11, 2026-06-30), it's
+the lowest-risk slice on the board (**read-only**: no new identity to mint, no accumulated judgment to
+unwind), and it doubles as a **diagnostic** that measures where the unit-conversion path (§4.2 #2) needs
+investment before we commit to it.
+
+> **Correction (2026-06-30):** an earlier draft of this section called the conversion engine "unbuilt."
+> That overstated the gap. `quantityToGrams` (`shared/units.ts`) already converts **mass** directly,
+> **volume** via `density_g_per_ml`, and **each-ish** units via `grams_per_each`, returning a typed
+> `null` reason for anything it can't. What's actually missing is **coverage** (density/each hints are
+> unseeded for most ingredients; genuinely unconvertible units like `"to taste"` stay `null`) and
+> **report integration** (nothing yet consumes it for a cost view). So the Tier-3 diagnostic below
+> measures *coverage gaps in an existing engine*, not the absence of one.
+
+### 15.1 Guiding principle — value-first, gap-honest, conversion as the forcing function
+
+Build the reports **in dependency order**, shipping the ones that are fully answerable on confirmed data
+today *first*, and let the conversion-gated reports land in an honest `partial`/`null` state. The volume
+of gaps they surface is the empirical signal for whether the conversion engine is the next investment —
+turning §4.2 #2 from a guess into a measured priority. Same no-silent-guessing discipline as the price
+gate (§5.5) and partial-nutrition display, applied to reporting: a figure we can't compute honestly is
+shown as a gap, never fabricated.
+
+### 15.2 Architecture fit (mirrors the existing nutrition slice)
+
+Reuse the three-layer split already established by nutrition (`db.ts` rows → `shared/nutrition.ts` pure
+rollup → `cli/nutrition-format.ts` pure formatting):
+
+- **`src/db/db.ts`** — new **read-only** methods returning typed rows from SQL joins. No new tables, no
+  migration; everything reads existing `price_observations` / `stores` / `ingredients` / `foods` /
+  `recipe_ingredients`. These are plumbing-tested over a temp db with seeded rows (like `db.test.ts`).
+- **`src/shared/reports.ts`** (new) — **pure** ranking / min-max / trend / gap-counting logic over those
+  rows. Deterministic, so it's TDD'd with `node:test` (unlike the parsers, which are evals). This is
+  where "cheapest wins," "latest vs first Δ," and "N of M observations comparable" live.
+- **`src/cli/report-format.ts`** (new) — pure string formatting (table rendering), unit-tested.
+- **`src/cli/report.ts`** (new) — thin dispatch + `console.log`, honoring `EATMODEL_DB` and loading
+  `.env` only for that (like `review.ts`); **never writes, never hits the network.**
+
+New script: `"report": "tsx src/cli/report.ts"` in `package.json`. No `:mock` variant — nothing here
+calls an LLM.
+
+### 15.3 The reports, tiered by dependency
+
+**Tier 1 — answerable on confirmed data today (no unit conversion needed):**
+
+| Report | CLI | db method (sketch) | Honesty rules |
+|---|---|---|---|
+| **Price history for an ingredient** | `report -- price <ingredient-id>` | `priceHistory(ingredientId)` → observations joined to canonical store, ordered by `observed_at`; report computes min / max / latest / first→latest Δ | Group by `(ingredient_id, unit)` — only compare like units. Flag observations where `unit IS NULL` or price fell back to `lineTotal` (the §14 whole-package caveat) rather than mixing them into a trend. **`price_observations` stores no explicit price-basis flag** — the fallback is *inferred* by joining `source_line_id` → `receipt_line_items` and checking whether `quantity` was absent (the condition under which `deriveUnitPrice` falls back). The db read method carries that join; the report reads the inferred flag. |
+| **Cheapest store for an ingredient** | `report -- cheapest <ingredient-id>` | `cheapestStoreFor(ingredientId)` → latest `unit_price` per **confirmed** `store_id`, ranked ascending | The north-star "cheapest store" query, unblocked by the store spine. Confirmed stores only (an unconfirmed `store_id` fragments the ranking). Same-unit only; heterogeneous units listed separately, not silently ranked against each other. |
+| **Store coverage index** | `report -- stores` | `storeCoverage()` → per store: observation count, distinct ingredients, date range | Tells you which stores have enough data to trust a "cheapest" claim. Pure count/coverage — no conversion. |
+
+**Tier 2 — recipe macros (CLI consolidation, not a new slice):**
+
+This is **already built** behind `review -- nutrition` (`db.listRecipeNutrition()` / `recipeNutrition(id)`
+at `db.ts:1125`, formatted by `cli/nutrition-format.ts:17`). Tier 2 is just surfacing the same path under
+`report` and adding an optional ranking — treat it as consolidation, not a major build.
+
+| Report | CLI | Source | Notes |
+|---|---|---|---|
+| **Recipe macro table** | `report -- macros [recipe-id]` | existing `listRecipeNutrition()` / `recipeNutrition(id)` | Reuse `formatRecipeNutrition`; keep the `(partial — N of M lines counted)` annotation. Only genuinely new logic is an optional rank by protein-per-serving where per-serving macros are known. |
+
+**Tier 3 — cost-per-nutrient (the north star, conversion-gated → ships as a diagnostic):**
+
+| Report | CLI | Why it's gated |
+|---|---|---|
+| **Protein-per-dollar / $/nutrient** | `report -- protein-per-dollar` | Needs price normalized to `$/g` **and** macro normalized to `g protein/g` — i.e. both the price `unit` and the food quantity must resolve to grams via `quantityToGrams(1, unit, hints)` (§15.1 correction). The engine exists; the gate is **coverage** — density/each hints and confirmed food links must be present. |
+
+Tier 3 ships **now** but only as far as the data honestly allows: run each candidate through the existing
+`quantityToGrams` path, compute the metric where it returns grams (mass-unit observation + confirmed food
+link, or a volume/each unit whose hint is set), and for everything else emit an explicit gap tagged with
+the **typed blocker** — reusing the reasons the engine already returns (`unconvertible unit`, `needs
+density_g_per_ml`, `needs grams_per_each`) plus the report-level ones (`no confirmed food link`, `no
+confirmed store`). That per-blocker tally is the deliverable that decides the next build.
+
+### 15.4 Definition of done & sequencing
+
+1. **This slice:** Tier 1 + Tier 2 reports, the `report` CLI, `shared/reports.ts` + `report-format.ts`
+   pure-tested, db read methods plumbing-tested, `npm run check` green. Tier 3 lands as the diagnostic
+   stub above (computable rows + typed gap counts), not a finished metric.
+2. **Then decide, from Tier 3's per-blocker tally, which lever pays off next:**
+   - `unconvertible unit` dominates → extend **conversion coverage** in `units.ts` (§4.2 #2) — new unit
+     handling, or accept the unit is inherently unconvertible (`"to taste"`).
+   - `needs density_g_per_ml` / `needs grams_per_each` dominates → seed those **ingredient hints** (via
+     `review -- set-density` / `set-each-grams`), or backfill them from **USDA FDC** portion data (§14).
+   - `no confirmed food link` dominates → more **food-link confirmations** (existing review gate), or the
+     USDA import that grows the `foods` catalog.
+   - `no confirmed store` dominates → **store confirmation / merge** (existing gate), or fuzzy store
+     matching (§14).
+
+   The report tells us which of these is actually limiting useful answers, instead of us guessing.
+
+### 15.5 Explicitly out of scope for this slice
+
+No new ingestion surface, no schema/migration, no fuzzy matching (manual `merge`/`merge-store` still the
+remedy — §14), no USDA import, no charts/HTML (CLI tables only during discovery). Reports read
+**confirmed** spine data; unconfirmed rows are excluded, not silently included, so a report is never more
+confident than the review gate is.

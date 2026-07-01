@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { Db } from "./db";
+import { proteinPerDollar } from "../shared/reports";
 import type { ParsedLineItem, ReceiptParseResult } from "../shared/types";
 import type { RecipeIngredientLine, RecipeParseResult, RecipePage } from "../shared/recipe-types";
 
@@ -480,6 +481,74 @@ test("merge rejects self-merge and unknown ids", () => {
   const [only] = db.listUnconfirmedIngredients();
   assert.throws(() => db.mergeIngredient(only!.id, only!.id), /itself/);
   assert.throws(() => db.mergeIngredient(only!.id, 9999), /no ingredient/);
+  db.close();
+});
+
+// --- delete-recipe -------------------------------------------------------
+
+test("delete-recipe removes the recipe, orphaned ingredients, and empty ingest", () => {
+  const db = freshDb();
+  // One image, two recipes sharing "Garlic"; the second also has "Basil".
+  const summary = db.saveRecipePage(
+    page([
+      recipe([ingredientLine("Garlic"), ingredientLine("Oregano")], "Keep"),
+      recipe([ingredientLine("Garlic"), ingredientLine("Basil")], "Junk"),
+    ]),
+    "spread.jpg",
+    "mock",
+    "h",
+  );
+  assert.equal(db.totals().ingredients, 3); // Garlic (shared), Oregano, Basil
+  const junk = summary.recipes[1]!;
+
+  const result = db.deleteRecipe(junk.recipeId);
+
+  assert.equal(result.deletedIngest, false); // sibling recipe still on the image
+  const totals = db.totals();
+  assert.equal(totals.recipes, 1); // only "Keep" survives
+  // Basil was unique to the junk recipe → orphaned and removed; Garlic is shared → kept.
+  assert.equal(totals.ingredients, 2); // Garlic + Oregano
+  assert.deepEqual(
+    result.deletedIngredientIds.length,
+    1,
+    "exactly one orphan (Basil) removed",
+  );
+  assert.ok(!db.listUnconfirmedIngredients().some((i) => i.canonicalName === "Basil"));
+  assert.ok(db.listUnconfirmedIngredients().some((i) => i.canonicalName === "Garlic"));
+  db.close();
+});
+
+test("delete-recipe drops the ingest when it was the image's last recipe", () => {
+  const db = freshDb();
+  const s = db.saveRecipe(recipe([ingredientLine("Nutmeg")]), "solo.jpg", "mock", "solo");
+  assert.equal(db.hasRecipe("solo"), true);
+
+  const result = db.deleteRecipe(s.recipeId);
+
+  assert.equal(result.deletedIngest, true);
+  assert.equal(db.hasRecipe("solo"), false); // ingest gone → image could be re-ingested
+  assert.equal(db.totals().recipes, 0);
+  assert.equal(db.totals().ingredients, 0); // Nutmeg orphaned and removed
+  db.close();
+});
+
+test("delete-recipe preserves a confirmed ingredient even when it orphans", () => {
+  const db = freshDb();
+  const s = db.saveRecipe(recipe([ingredientLine("Saffron")]), "r.jpg", "mock", "r");
+  const saffronId = s.lines[0]!.ingredientId!;
+  db.confirmIngredient(saffronId); // human judgment: keep it in the spine
+
+  const result = db.deleteRecipe(s.recipeId);
+
+  assert.deepEqual(result.deletedIngredientIds, []); // confirmed → not deleted
+  assert.equal(db.totals().recipes, 0);
+  assert.equal(db.totals().ingredients, 1); // Saffron survives, now unused
+  db.close();
+});
+
+test("delete-recipe rejects an unknown recipe id", () => {
+  const db = freshDb();
+  assert.throws(() => db.deleteRecipe(9999), /no recipe/);
   db.close();
 });
 

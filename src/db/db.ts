@@ -8,12 +8,19 @@ import {
   isSaneNumber,
   reviewLineReason,
   reconcileReceiptTotal,
+  planRecipeDeletion,
 } from "../shared/review";
 import {
   rollupRecipeNutrition,
   type Macros,
   type NutritionRollup,
 } from "../shared/nutrition";
+import type {
+  PriceObservationRow,
+  StorePriceRow,
+  StoreCoverageRow,
+  ProteinPerDollarCandidate,
+} from "../shared/reports";
 import type { ReceiptParseResult } from "../shared/types";
 import type { RecipeParseResult, RecipePage } from "../shared/recipe-types";
 
@@ -317,6 +324,16 @@ export interface SaveRecipePageSummary {
   newIngredients: number;
 }
 
+/** What a deleteRecipe call removed, so the CLI can report it. */
+export interface RecipeDeletionSummary {
+  recipeId: number;
+  title: string | null;
+  /** Orphaned ingredients that were also removed (with their aliases). */
+  deletedIngredientIds: number[];
+  /** True if this was the last recipe on its image and the ingest went too. */
+  deletedIngest: boolean;
+}
+
 /** An ingredient awaiting human confirmation (review gate). */
 export interface UnconfirmedIngredient {
   id: number;
@@ -371,6 +388,13 @@ export interface RecipeNutritionSummary {
   title: string | null;
   servings: number | null;
   nutrition: NutritionRollup;
+}
+
+/** A canonical ingredient that has at least one price observation (report discovery). */
+export interface PricedIngredient {
+  id: number;
+  canonicalName: string;
+  observations: number;
 }
 
 export class Db {
@@ -1283,6 +1307,83 @@ export class Db {
   }
 
   /**
+   * Delete a mis-captured recipe (e.g. a partial re-photo) along with its
+   * ingredient lines, any ingredients it orphans (plus their aliases), and its
+   * ingest row if it was the last recipe on that image. Ingredients still used
+   * by another recipe/receipt/price fact — and any *confirmed* ingredient — are
+   * preserved (see planRecipeDeletion). `raw_json`/`recipe_count` on a surviving
+   * ingest are left as parse-time provenance. All in one transaction.
+   */
+  deleteRecipe(recipeId: number): RecipeDeletionSummary {
+    return this.db.transaction((): RecipeDeletionSummary => {
+      const recipe = this.db
+        .prepare("SELECT ingest_id AS ingestId, title FROM recipes WHERE id = ?")
+        .get(recipeId) as { ingestId: number; title: string | null } | undefined;
+      if (!recipe) throw new Error(`no recipe with id ${recipeId}`);
+
+      // Usage of each ingredient this recipe references, counting only refs that
+      // would REMAIN once the recipe's own lines are deleted.
+      const usage = this.db
+        .prepare(
+          `SELECT i.id AS ingredientId,
+                  CASE WHEN i.status = 'confirmed' THEN 1 ELSE 0 END AS confirmed,
+                  (SELECT COUNT(*) FROM recipe_ingredients x
+                     WHERE x.ingredient_id = i.id AND x.recipe_id <> ?) AS otherRecipeRefs,
+                  (SELECT COUNT(*) FROM receipt_line_items x WHERE x.ingredient_id = i.id) AS receiptRefs,
+                  (SELECT COUNT(*) FROM price_observations x WHERE x.ingredient_id = i.id) AS priceObsRefs
+           FROM ingredients i
+           WHERE i.id IN (SELECT DISTINCT ingredient_id FROM recipe_ingredients
+                          WHERE recipe_id = ? AND ingredient_id IS NOT NULL)`,
+        )
+        .all(recipeId, recipeId) as {
+        ingredientId: number;
+        confirmed: number;
+        otherRecipeRefs: number;
+        receiptRefs: number;
+        priceObsRefs: number;
+      }[];
+
+      const otherRecipesInIngest = (
+        this.db
+          .prepare("SELECT COUNT(*) AS n FROM recipes WHERE ingest_id = ? AND id <> ?")
+          .get(recipe.ingestId, recipeId) as { n: number }
+      ).n;
+
+      const plan = planRecipeDeletion(
+        usage.map((u) => ({
+          ingredientId: u.ingredientId,
+          confirmed: u.confirmed === 1,
+          otherRecipeRefs: u.otherRecipeRefs,
+          receiptRefs: u.receiptRefs,
+          priceObsRefs: u.priceObsRefs,
+        })),
+        otherRecipesInIngest,
+      );
+
+      // Children first (FK is ON): lines, then the recipe.
+      this.db.prepare("DELETE FROM recipe_ingredients WHERE recipe_id = ?").run(recipeId);
+      this.db.prepare("DELETE FROM recipes WHERE id = ?").run(recipeId);
+
+      // Orphaned ingredients: aliases first (FK), then the ingredient.
+      for (const id of plan.orphanIngredientIds) {
+        this.db.prepare("DELETE FROM ingredient_aliases WHERE ingredient_id = ?").run(id);
+        this.db.prepare("DELETE FROM ingredients WHERE id = ?").run(id);
+      }
+
+      if (plan.deleteIngest) {
+        this.db.prepare("DELETE FROM recipe_ingests WHERE id = ?").run(recipe.ingestId);
+      }
+
+      return {
+        recipeId,
+        title: recipe.title,
+        deletedIngredientIds: plan.orphanIngredientIds,
+        deletedIngest: plan.deleteIngest,
+      };
+    })();
+  }
+
+  /**
    * Merge a duplicate/fragment store into another. Raw receipt.store text stays
    * unchanged; canonical store_id links and aliases move to the kept store.
    */
@@ -1303,6 +1404,172 @@ export class Db {
   }
 
   /** Quick counts for the end-of-run summary. */
+  // ── Read-only report queries (ARCHITECTURE §15) ────────────────────────────
+  // These never write. They join the spine and hand raw rows to the pure report
+  // logic in shared/reports.ts, which does all ranking/coverage/gap math.
+
+  /** Look up a canonical ingredient by id (for report headers); null if absent. */
+  getIngredient(id: number): { id: number; canonicalName: string } | null {
+    const row = this.db
+      .prepare("SELECT id, canonical_name AS canonicalName FROM ingredients WHERE id = ?")
+      .get(id) as { id: number; canonicalName: string } | undefined;
+    return row ?? null;
+  }
+
+  /** Canonical ingredients with price data, most-observed first (report discovery). */
+  listPricedIngredients(): PricedIngredient[] {
+    return this.db
+      .prepare(
+        `SELECT i.id, i.canonical_name AS canonicalName, COUNT(po.id) AS observations
+         FROM ingredients i
+         JOIN price_observations po ON po.ingredient_id = i.id
+         GROUP BY i.id
+         ORDER BY observations DESC, i.canonical_name`,
+      )
+      .all() as PricedIngredient[];
+  }
+
+  /**
+   * Every price observation for one ingredient, store-joined. `wholePackageFallback`
+   * is *inferred* — `price_observations` stores no basis flag, so we look at the
+   * source receipt line: `deriveUnitPrice` only falls back to the line total when
+   * the line had no explicit unit price and no usable quantity (§15.3).
+   */
+  priceHistoryRows(ingredientId: number): PriceObservationRow[] {
+    const rows = this.db
+      .prepare(
+        `SELECT po.store_id AS storeId, s.canonical_name AS storeName,
+                s.status AS storeStatus, po.observed_at AS observedAt,
+                po.unit, po.unit_price AS unitPrice, po.currency,
+                rli.unit_price AS lineUnitPrice, rli.quantity AS lineQuantity,
+                po.source_line_id AS sourceLineId
+         FROM price_observations po
+         LEFT JOIN stores s ON s.id = po.store_id
+         LEFT JOIN receipt_line_items rli ON rli.id = po.source_line_id
+         WHERE po.ingredient_id = ?
+         ORDER BY po.observed_at`,
+      )
+      .all(ingredientId) as {
+      storeId: number | null;
+      storeName: string | null;
+      storeStatus: string | null;
+      observedAt: string | null;
+      unit: string | null;
+      unitPrice: number;
+      currency: string | null;
+      lineUnitPrice: number | null;
+      lineQuantity: number | null;
+      sourceLineId: number | null;
+    }[];
+
+    return rows.map((r) => ({
+      storeId: r.storeId,
+      storeName: r.storeName,
+      storeConfirmed: r.storeStatus === "confirmed",
+      observedAt: r.observedAt,
+      unit: r.unit,
+      unitPrice: r.unitPrice,
+      currency: r.currency,
+      wholePackageFallback:
+        r.sourceLineId != null &&
+        r.lineUnitPrice == null &&
+        (r.lineQuantity == null || r.lineQuantity === 0),
+    }));
+  }
+
+  /** Confirmed-store price observations for an ingredient (unconfirmed stores excluded). */
+  confirmedStorePriceRows(ingredientId: number): StorePriceRow[] {
+    return this.db
+      .prepare(
+        `SELECT po.store_id AS storeId, s.canonical_name AS storeName,
+                po.unit, po.unit_price AS unitPrice, po.observed_at AS observedAt, po.currency
+         FROM price_observations po
+         JOIN stores s ON s.id = po.store_id AND s.status = 'confirmed'
+         WHERE po.ingredient_id = ?`,
+      )
+      .all(ingredientId) as StorePriceRow[];
+  }
+
+  /** Per-store price-data coverage, so a "cheapest" claim can be weighed against its evidence. */
+  storeCoverageRows(): StoreCoverageRow[] {
+    const rows = this.db
+      .prepare(
+        `SELECT s.id AS storeId, s.canonical_name AS storeName, s.status,
+                COUNT(po.id) AS observations,
+                COUNT(DISTINCT po.ingredient_id) AS distinctIngredients,
+                MIN(po.observed_at) AS firstObservedAt,
+                MAX(po.observed_at) AS lastObservedAt
+         FROM stores s
+         LEFT JOIN price_observations po ON po.store_id = s.id
+         GROUP BY s.id`,
+      )
+      .all() as (Omit<StoreCoverageRow, "confirmed"> & { status: string })[];
+    return rows.map((r) => ({
+      storeId: r.storeId,
+      storeName: r.storeName,
+      confirmed: r.status === "confirmed",
+      observations: r.observations,
+      distinctIngredients: r.distinctIngredients,
+      firstObservedAt: r.firstObservedAt,
+      lastObservedAt: r.lastObservedAt,
+    }));
+  }
+
+  /**
+   * Confirmed ingredients as protein-per-dollar candidates: confirmed-food protein,
+   * most-recent confirmed-store price, and conversion hints. One row per ingredient;
+   * the pure report decides what's computable and tallies the blockers (§15.3).
+   */
+  proteinPerDollarCandidates(): ProteinPerDollarCandidate[] {
+    const rows = this.db
+      .prepare(
+        `WITH confirmed_prices AS (
+           SELECT po.ingredient_id AS ingredient_id, po.unit AS unit,
+                  po.unit_price AS unit_price, s.canonical_name AS store_name,
+                  ROW_NUMBER() OVER (
+                    PARTITION BY po.ingredient_id
+                    ORDER BY po.observed_at DESC, po.id DESC
+                  ) AS rn
+           FROM price_observations po
+           JOIN stores s ON s.id = po.store_id AND s.status = 'confirmed'
+         )
+         SELECT i.id AS ingredientId, i.canonical_name AS ingredientName,
+                i.density_g_per_ml AS densityGPerMl, i.grams_per_each AS gramsPerEach,
+                i.food_link_status AS foodLinkStatus,
+                f.protein_g_per_100g AS proteinGPer100g,
+                cp.unit AS priceUnit, cp.unit_price AS priceUnitPrice, cp.store_name AS storeName
+         FROM ingredients i
+         LEFT JOIN foods f ON f.id = i.food_id
+         LEFT JOIN confirmed_prices cp ON cp.ingredient_id = i.id AND cp.rn = 1
+         WHERE i.status = 'confirmed'
+         ORDER BY i.canonical_name`,
+      )
+      .all() as {
+      ingredientId: number;
+      ingredientName: string;
+      densityGPerMl: number | null;
+      gramsPerEach: number | null;
+      foodLinkStatus: "proposed" | "confirmed" | null;
+      proteinGPer100g: number | null;
+      priceUnit: string | null;
+      priceUnitPrice: number | null;
+      storeName: string | null;
+    }[];
+
+    return rows.map((r) => ({
+      ingredientId: r.ingredientId,
+      ingredientName: r.ingredientName,
+      hasConfirmedFoodLink: r.foodLinkStatus === "confirmed" && r.proteinGPer100g != null,
+      proteinGPer100g: r.proteinGPer100g,
+      price:
+        r.priceUnitPrice != null && r.storeName != null
+          ? { unitPrice: r.priceUnitPrice, unit: r.priceUnit, storeName: r.storeName }
+          : null,
+      densityGPerMl: r.densityGPerMl,
+      gramsPerEach: r.gramsPerEach,
+    }));
+  }
+
   totals(): {
     ingredients: number;
     receipts: number;

@@ -61,3 +61,45 @@ export function reconcileReceiptTotal(total: number | null, lineTotals: number[]
   }
   return null;
 }
+
+/**
+ * Deleting a mis-captured recipe (e.g. a partial re-photo) must also clean up
+ * what it leaves dangling — but only what nothing else depends on. This is the
+ * pure decision half; the db half just executes the returned plan.
+ *
+ * Reference counts are what would REMAIN after the recipe's own lines are gone:
+ * `otherRecipeRefs` excludes the recipe being deleted. An ingredient is an
+ * orphan iff no other recipe, receipt, or price fact still references it.
+ *
+ * A *confirmed* ingredient is never deleted, even when orphaned: confirmation is
+ * accumulated human judgment about the spine (ARCHITECTURE.md §5.5), not a
+ * byproduct of one recipe, so it must outlive the recipe that introduced it.
+ */
+export interface IngredientDeletionUsage {
+  ingredientId: number;
+  confirmed: boolean;
+  /** recipe_ingredients rows in recipes *other than* the one being deleted. */
+  otherRecipeRefs: number;
+  receiptRefs: number;
+  priceObsRefs: number;
+}
+
+export interface RecipeDeletionPlan {
+  /** Unconfirmed ingredients (and their aliases) safe to delete. */
+  orphanIngredientIds: number[];
+  /** True when this was the last recipe on its image, so the ingest goes too. */
+  deleteIngest: boolean;
+}
+
+export function planRecipeDeletion(
+  ingredients: IngredientDeletionUsage[],
+  otherRecipesInIngest: number,
+): RecipeDeletionPlan {
+  const orphanIngredientIds = ingredients
+    .filter(
+      (i) =>
+        !i.confirmed && i.otherRecipeRefs === 0 && i.receiptRefs === 0 && i.priceObsRefs === 0,
+    )
+    .map((i) => i.ingredientId);
+  return { orphanIngredientIds, deleteIngest: otherRecipesInIngest === 0 };
+}
