@@ -1262,6 +1262,34 @@ export class Db {
     return rows.map(({ id, canonicalName }) => ({ id, canonicalName }));
   }
 
+  /**
+   * Confirmed-linked ingredients whose reference food has an FDC id, with their
+   * current conversion hints — the targets for the portion backfill (Lever C).
+   * Only confirmed links (trusted spine); the caller fills a hint only when it's
+   * still null, so a human-set density/each is never overwritten.
+   */
+  confirmedLinkedFoodRefs(): {
+    ingredientId: number;
+    fdcId: string;
+    densityGPerMl: number | null;
+    gramsPerEach: number | null;
+  }[] {
+    return this.db
+      .prepare(
+        `SELECT i.id AS ingredientId, f.fdc_id AS fdcId,
+                i.density_g_per_ml AS densityGPerMl, i.grams_per_each AS gramsPerEach
+         FROM ingredients i
+         JOIN foods f ON f.id = i.food_id
+         WHERE i.food_link_status = 'confirmed' AND f.fdc_id IS NOT NULL`,
+      )
+      .all() as {
+      ingredientId: number;
+      fdcId: string;
+      densityGPerMl: number | null;
+      gramsPerEach: number | null;
+    }[];
+  }
+
   listIngredientsMissingFoodLink(): IngredientMissingFoodLink[] {
     return this.db
       .prepare(

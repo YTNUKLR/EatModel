@@ -743,6 +743,26 @@ Each phase should be independently useful. Don't build all six modules at once.
     (`eggs→Egg, whole, raw`, `sugar→Sugar, granulated`) and **abstained** on `Italian seasoning` and
     `bacon` with reasons — the no-silent-guessing gate proving its worth. **Still open in B:** an eval
     harness (hand-checked ingredient→food fixtures) — the §2 "LLM = eval, not unit test" discipline.
+- **2026-07-01** — **Portion→conversion backfill built (Lever C — the make-or-break, §4.2 #2).**
+  `npm run backfill-conversions -- <bundle-dir>` derives a confirmed-linked ingredient's
+  `density_g_per_ml` / `grams_per_each` from its reference food's FDC portion data, turning
+  *linked-but-unconvertible* volume/count lines into counted macros without hand-entered densities.
+  - **Density** (primary, safe) from volume portions (`cup`/`tbsp`/`tsp`): `density = gram_weight /
+    (amount × ml_per_unit)`. **grams_per_each** (narrow) only from portions whose unit is one the
+    recipe side actually uses and `units.ts` converts (`clove`/`each`/`item`) — e.g. garlic `1 clove =
+    3 g`. Units like `medium`/`large`/`slice` are intentionally *not* harvested (they aren't recipe
+    each-units), so we never invent a `grams_per_each` a line can't use.
+  - **Reality of the data:** SR Legacy stores the unit in the free-text `modifier` (e.g. `"cup,
+    chopped"`, `"clove"`), not `measure_unit_id` (almost always `9999`/undetermined). Derivation scans
+    `measure_unit name + modifier` for a recognized unit token — via new `volumeMlPerUnit` / `isEachUnit`
+    seams exported from `units.ts` (keeping the unit maps in one place). Multiple volume portions
+    (`"cup, chopped"` vs `"cup, sliced"`) are reconciled by **median**, robust to the odd outlier.
+  - **Judgment-safe:** only **confirmed** links, and only fills a **null** hint — never overwrites a
+    human-set density/each. Underivable (no usable portion) → left null (no-silent-guessing); the
+    dashboard keeps showing it as a conversion gap.
+  - Same three-layer split: pure parse+derive (`parser/fdc-portions.ts`, `derivePortionHints`), db feed
+    (`confirmedLinkedFoodRefs`), thin CLI (`cli/backfill-conversions.ts`) that sets only-null hints and
+    prints a summary. TDD the pure core.
 
 ---
 

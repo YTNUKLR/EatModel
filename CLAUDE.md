@@ -30,9 +30,10 @@ Two photo-ingest slices are live, both feeding the same SQLite spine via the `db
   shortlist → LLM picks or abstains → gated proposal). Coverage: `npm run report -- coverage`.
 - **Store-identity spine (§14)** — `stores`/`store_aliases`, `receipts.store_id`; `confirm-store`/`merge-store`.
 
-**Next up:** finish systematic nutrition coverage (ARCHITECTURE §11 2026-07-01 three-lever plan — dashboard
-built, assisted linker built, **portion→conversion backfill from FDC `food_portion.csv` still open**) and
-**ingest a real receipt** (db is recipe-only, so the whole price/cost half is still dark).
+**Next up:** the systematic-nutrition-coverage three-lever plan (ARCHITECTURE §11 2026-07-01) is **built**
+(coverage dashboard + assisted linker + portion backfill); remaining polish = a FoodLinker eval harness and
+a `not-nutrition-relevant` per-line resolution. Then **apply it all to the real db** (still 9 seeds / 0 links —
+every demo ran on a scratch copy) and **ingest a real receipt** (db is recipe-only, so the price/cost half is dark).
 
 ## Run
 
@@ -42,6 +43,7 @@ built, assisted linker built, **portion→conversion backfill from FDC `food_por
 | `npm run recipes` / `recipes:mock` | Ingest recipe photos from `recipes/inbox/` |
 | `npm run review [-- <cmd>]` | Inspect/resolve flagged data + manage food/store links (see current-state above; `link-suggest` needs a key, or `EATMODEL_FOOD_LINKER=mock`) |
 | `npm run import-foods -- <dir>` | Load a USDA FDC bulk CSV bundle (unzipped) into the `foods` catalog |
+| `npm run backfill-conversions -- <dir>` | Derive density / grams-per-each on confirmed links from FDC portion data |
 | `npm run report [-- coverage \| macros \| price \| cheapest \| stores \| protein-per-dollar]` | Read-only reports over the spine |
 | `npm run check` | **Typecheck + tests — must be green before merging to `main`** |
 | `npm run db:reset` | Drop `data/eatmodel.db` (use if a db predates a schema change) |

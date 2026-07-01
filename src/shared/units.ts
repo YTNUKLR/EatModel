@@ -80,6 +80,21 @@ function isPositiveFinite(value: number | null | undefined): value is number {
 }
 
 /**
+ * Milliliters for one of `unit` if it's a known volume unit, else null. Exposes
+ * the volume table (kept private) so the FDC portion backfill can invert it:
+ * density = gram_weight / (amount × volumeMlPerUnit). Same unit vocabulary the
+ * forward conversion uses, so backfill and rollup can never disagree on units.
+ */
+export function volumeMlPerUnit(unit: string): number | null {
+  return VOLUME_TO_ML[cleanUnit(unit)] ?? null;
+}
+
+/** True if `unit` is an each-ish unit (each/item/clove) — the countable units a recipe uses. */
+export function isEachUnit(unit: string): boolean {
+  return EACH_UNITS.has(cleanUnit(unit));
+}
+
+/**
  * Convert a parsed recipe quantity to grams when the conversion is trustworthy.
  * Mass units are direct. Volume and each units require ingredient-specific
  * facts. Unknowns stay unknown; callers surface the reason instead of guessing.
