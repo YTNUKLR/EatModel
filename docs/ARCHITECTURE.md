@@ -725,6 +725,24 @@ Each phase should be independently useful. Don't build all six modules at once.
     `not-nutrition-relevant` resolution (mirroring `resolve-line`) so those stop counting against
     completeness — otherwise the dashboard nags forever and invites fabrication. Loop A→(B,C)→A until it
     converges green.
+- **2026-07-01** — **Assisted `FoodLinker` built (Lever B).** `review -- link-suggest [ingredient-id]`
+  now proposes ingredient→food links for unlinked ingredients; a human still confirms. Three parts:
+  - **Pure candidate generation** (`shared/food-match.ts` `rankFoodCandidates`): token-coverage scoring
+    over the catalog, narrowing ~8k foods to a ranked shortlist. Optimizes for **recall** (get the right
+    food into the top ~12), leaving judgment to the gate. Light singular-stemming (`onion`↔`Onions`) was
+    essential for recall; a raw-form bonus + prepared/mix/soup/gravy penalty keeps the plain base food
+    above derived entries. Empty result = honest "no lexical candidate," not a forced guess.
+  - **`FoodLinker` interface + two impls** (`parser/food-linker*.ts`): `Mock` (deterministic top-pick,
+    keyless — runs/tests the whole flow) and `Llm` (Claude picks from the shortlist **or abstains**; a
+    hallucinated id not in the shortlist is coerced to abstain). Selected via `EATMODEL_FOOD_LINKER`
+    (default `llm`, fail-loud on missing key), mirroring the parser selection.
+  - **Gated wiring** (`cli/link-suggest.ts`): each pick is staged as `food_link_status='proposed'` via
+    the §5.5 gate — never confirmed. Assisted, not automatic.
+  - **Validated live**: mock over the real catalog proposed 167 links but mislinked the ambiguous ones
+    (`eggs→Bread, egg`, `sugar→Sugars, brown`, `bacon→Bacon, meatless`); the LLM fixed each
+    (`eggs→Egg, whole, raw`, `sugar→Sugar, granulated`) and **abstained** on `Italian seasoning` and
+    `bacon` with reasons — the no-silent-guessing gate proving its worth. **Still open in B:** an eval
+    harness (hand-checked ingredient→food fixtures) — the §2 "LLM = eval, not unit test" discipline.
 
 ---
 

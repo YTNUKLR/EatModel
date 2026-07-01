@@ -1,8 +1,12 @@
 import fs from "node:fs";
 import { Db } from "../db/db";
 import { formatMacros, formatRecipeNutrition } from "./nutrition-format";
+import { runLinkSuggest, formatLinkSuggest } from "./link-suggest";
+import { selectFoodLinker } from "./select-food-linker";
 
-// Load .env for EATMODEL_DB if set; this CLI never calls the network.
+// Load .env for EATMODEL_DB and (for `link-suggest` with the LLM linker) the API
+// key. Every command except `link-suggest` is offline; `link-suggest` calls the
+// linker (network) only when EATMODEL_FOOD_LINKER is the default "llm".
 if (fs.existsSync(".env")) process.loadEnvFile(".env");
 
 const DB_PATH = process.env.EATMODEL_DB ?? "data/eatmodel.db";
@@ -36,6 +40,8 @@ const USAGE = `Review gate — inspect and resolve what the ingest flagged.
                                   set density for volume→grams conversion
   npm run review -- set-each-grams <ingredient-id> <grams>
                                   set grams-per-each for clove/each conversion
+  npm run review -- link-suggest [ingredient-id]
+                                  propose food links for unlinked ingredients (assisted; you confirm)
   npm run review -- nutrition [recipe-id]
                                   show recipe macro rollups and partial reasons
 `;
@@ -145,7 +151,7 @@ function printNutrition(db: Db, recipeId: number | null): void {
   }
 }
 
-function main(): void {
+async function main(): Promise<void> {
   const [cmd, ...rest] = process.argv.slice(2);
   const db = new Db(DB_PATH);
   try {
@@ -225,6 +231,11 @@ function main(): void {
       const grams = numberArg(rest[1], "grams");
       db.setIngredientGramsPerEach(ingredientId, grams);
       console.log(`✓ set grams_per_each=${grams} for ingredient #${ingredientId}`);
+    } else if (cmd === "link-suggest") {
+      const ingredientId = rest[0] == null ? undefined : intArg(rest[0], "ingredient id");
+      const linker = selectFoodLinker();
+      const summary = await runLinkSuggest(db, linker, { ingredientId });
+      console.log(formatLinkSuggest(summary).join("\n"));
     } else if (cmd === "nutrition") {
       const recipeId = rest[0] == null ? null : intArg(rest[0], "recipe id");
       printNutrition(db, recipeId);
@@ -237,4 +248,7 @@ function main(): void {
   }
 }
 
-main();
+main().catch((err) => {
+  console.error(err instanceof Error ? err.message : err);
+  process.exitCode = 1;
+});

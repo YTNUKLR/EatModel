@@ -1234,6 +1234,34 @@ export class Db {
       .all() as ProposedFoodLink[];
   }
 
+  /**
+   * Ingredients that still need a food link, as targets for `link-suggest`.
+   * With no id: every unlinked ingredient referenced by a non-optional recipe
+   * line, ranked by how many such lines it blocks (highest impact first). With
+   * an id: just that ingredient, iff it exists and is unlinked (so a single
+   * suggest can't silently overwrite a confirmed link).
+   */
+  ingredientsToLink(onlyId?: number): { id: number; canonicalName: string }[] {
+    if (onlyId != null) {
+      return this.db
+        .prepare(
+          "SELECT id, canonical_name AS canonicalName FROM ingredients WHERE id = ? AND food_id IS NULL",
+        )
+        .all(onlyId) as { id: number; canonicalName: string }[];
+    }
+    const rows = this.db
+      .prepare(
+        `SELECT i.id AS id, i.canonical_name AS canonicalName, COUNT(*) AS lines
+         FROM ingredients i
+         JOIN recipe_ingredients ri ON ri.ingredient_id = i.id AND ri.optional = 0
+         WHERE i.food_id IS NULL
+         GROUP BY i.id
+         ORDER BY lines DESC, i.canonical_name`,
+      )
+      .all() as { id: number; canonicalName: string; lines: number }[];
+    return rows.map(({ id, canonicalName }) => ({ id, canonicalName }));
+  }
+
   listIngredientsMissingFoodLink(): IngredientMissingFoodLink[] {
     return this.db
       .prepare(

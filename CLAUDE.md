@@ -21,12 +21,18 @@ Two photo-ingest slices are live, both feeding the same SQLite spine via the `db
   → many `recipes`.
 - **Review / confidence gate (§5.5)** — new ingredients persist as `status='unconfirmed'`; untrustworthy
   lines are **flagged, not dropped** (and never become price facts); receipt totals are reconciled.
-  Resolve via `npm run review` (`list` / `confirm <id>` / `merge <from> <into>` /
-  `delete-recipe <id>` / `set-source <recipe-id> <text>` / `resolve-line <receipt|recipe> <id>` /
-  `resolve-receipt <id>`).
+  Resolve via `npm run review` (`list` / `confirm` / `merge` / `delete-recipe` / `set-source` /
+  `resolve-line` / `resolve-receipt`; food links: `foods` / `link-food` / `confirm-food` /
+  `link-suggest` / `set-density` / `set-each-grams`; stores: `confirm-store` / `merge-store`).
+- **Nutrition spine (§6)** — gated `ingredient.food_id` link to a `foods` catalog; pure `shared/nutrition.ts`
+  rollup (`null`-honest, `⚠ partial`). Catalog seeded, then grown via **USDA FDC import**
+  (`npm run import-foods -- <unzipped-bundle-dir>`). **Assisted linking**: `review -- link-suggest` (lexical
+  shortlist → LLM picks or abstains → gated proposal). Coverage: `npm run report -- coverage`.
+- **Store-identity spine (§14)** — `stores`/`store_aliases`, `receipts.store_id`; `confirm-store`/`merge-store`.
 
-**Next identity decision, not yet built:** a **store-identity spine** for receipts (`receipts.store` is
-still free text, which blocks "cheapest store"). See `ARCHITECTURE.md` §14 for the full deferred backlog.
+**Next up:** finish systematic nutrition coverage (ARCHITECTURE §11 2026-07-01 three-lever plan — dashboard
+built, assisted linker built, **portion→conversion backfill from FDC `food_portion.csv` still open**) and
+**ingest a real receipt** (db is recipe-only, so the whole price/cost half is still dark).
 
 ## Run
 
@@ -34,7 +40,9 @@ still free text, which blocks "cheapest store"). See `ARCHITECTURE.md` §14 for 
 |---|---|
 | `npm run process` / `process:mock` | Ingest receipt photos from `receipts/inbox/` (real OCR / canned mock) |
 | `npm run recipes` / `recipes:mock` | Ingest recipe photos from `recipes/inbox/` |
-| `npm run review [-- confirm <id> \| merge <from> <into> \| delete-recipe <id> \| resolve-line <receipt\|recipe> <id> \| resolve-receipt <id>]` | Inspect/resolve flagged data |
+| `npm run review [-- <cmd>]` | Inspect/resolve flagged data + manage food/store links (see current-state above; `link-suggest` needs a key, or `EATMODEL_FOOD_LINKER=mock`) |
+| `npm run import-foods -- <dir>` | Load a USDA FDC bulk CSV bundle (unzipped) into the `foods` catalog |
+| `npm run report [-- coverage \| macros \| price \| cheapest \| stores \| protein-per-dollar]` | Read-only reports over the spine |
 | `npm run check` | **Typecheck + tests — must be green before merging to `main`** |
 | `npm run db:reset` | Drop `data/eatmodel.db` (use if a db predates a schema change) |
 
