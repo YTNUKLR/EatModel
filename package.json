@@ -13,6 +13,7 @@
     "recipes": "tsx src/cli/process-recipes.ts",
     "recipes:mock": "EATMODEL_RECIPE_PARSER=mock tsx src/cli/process-recipes.ts",
     "review": "tsx src/cli/review.ts",
+    "import-foods": "tsx src/cli/import-foods.ts",
     "report": "tsx src/cli/report.ts",
     "eval": "tsx src/cli/eval-receipts.ts",
     "eval:mock": "EATMODEL_PARSER=mock tsx src/cli/eval-receipts.ts",

@@ -664,6 +664,67 @@ Each phase should be independently useful. Don't build all six modules at once.
   now," cheapest-basket, protein-per-$ within variety), so slices can be judged by which query they light
   up. (4) **§12/§14 eval-harness gap** — `CONVENTIONS §2` specifies a parser eval; none exists, leaving
   the riskiest subsystem with no regression signal. No code; these steer the upcoming nutrition slice.
+- **2026-07-01** — **USDA FDC food-catalog import (grows the §6 catalog past the 9 seeds).** The
+  nutrition *engine* has been live since 2026-06-30, but with only 9 manual `foods` no real recipe can
+  produce macros — every rollup is `partial`. This closes the §14 coverage gap.
+  - **Datasets: SR Legacy (~7.8k generic whole foods) + Foundation (~few hundred, richest/newest).**
+    Excludes **Branded** (~1.9M packaged products — barcode/calorie-app territory, explicitly out of
+    scope §1.9) and **FNDDS/Survey** (mixed prepared dishes — noisy for a "what we cook" spine, revisit
+    later). Both chosen bundles are **public domain** (US Government work); the bulk CSVs need **no API
+    key**.
+  - **Download + unzip is a manual step; the CLI reads a directory of unzipped CSVs.** Same ethos as the
+    synced-inbox queue (§7): reuse OS tools, don't build (or take a dependency to build) an unzip stage.
+    Keeps the dep list at 3 and the parser pure — a hand-rolled RFC-4180 reader over tiny CSV fixtures,
+    fully unit-testable.
+  - **Parse by header *name*, not column position** → robust to FDC layout drift across releases. Macros
+    are selected by **explicit nutrient id**: energy `1008` kcal (fallback Atwater `2048`→`2047` for
+    Foundation rows that omit 1008), protein `1003`, fat `1004`, carbs `1005` — never energy-as-kJ
+    (`1062`). `food_nutrient.amount` is already per-100 g (the FDC basis), so it maps straight onto our
+    `*_per_100g` columns with no rescaling. A food missing the energy row is **skipped, not zero-filled**
+    (no-silent-guessing).
+  - **Idempotent, keyed by `fdc_id`.** Re-running upserts (refreshes macros) rather than duplicating.
+    `foods.description` is also `UNIQUE`: a USDA row colliding with an **unlinked** manual seed of the
+    same description **replaces** the seed (the seeds are USDA-derived anyway, §14 cleanup) — but a seed
+    that an ingredient already **links** to is never clobbered; the collision is surfaced and skipped,
+    protecting accumulated judgment (§14 triage). 0 links exist today, so this is a safety rail, not a
+    live case.
+  - **Layering mirrors the nutrition slice** (§6): `parser/fdc.ts` (pure parse + macro mapping) →
+    `Db.importFoods` (one bulk upsert transaction) → `cli/import-foods.ts` (I/O: read the dir, call,
+    print a coverage summary). TDD the pure parser; assert plumbing on the CLI. Portion data
+    (`food_portion.csv` → `grams_per_each`/`density_g_per_ml`) is a deliberate **follow-up**, not v0 —
+    the make-or-break conversion coverage (§4.2 #2) is worth its own slice.
+- **2026-07-01** — **Plan: systematic nutrition coverage for every recipe (three levers).** With the
+  catalog imported, the goal shifts from "can we compute macros" (yes) to "is every recipe complete."
+  Framing decision: the **canonical spine makes this finite** — you link ~187 distinct ingredients
+  *once*, not 311 lines × 33 recipes, and each linked ingredient lights up every recipe that shares it
+  (verified live: linking ~14 shared ingredients on a scratch db counted 50 lines across many recipes,
+  not just the one being worked). The realistic target is far fewer — the top ~40 by frequency cover the
+  bulk. Three levers, in order:
+  - **(A) Coverage dashboard** *(built now — `report -- coverage`)*: pure `summarizeNutritionCoverage`
+    over a flat per-line feed (`db.recipeLineNutritionRows`), classifying each non-optional line as
+    counted / `no_food_link` / `unconvertible` (food-link checked first, matching the rollup). Emits
+    per-recipe complete/partial, a **blocker split** (is the residual a *linking* or a *conversion*
+    problem?), and an **impact-ranked queue of unlinked ingredients** (most recipe-lines unblocked
+    first) — turning "link everything" into a prioritized, measurable worklist. `linkableToComplete` is
+    a best-case signal (a freshly-linked line can still need a hint), labelled as such — no overclaim.
+  - **(B) Assisted `FoodLinker`** *(next)*: automate the *proposal*, keep the human *confirmation* — same
+    §5.5 gate. Hybrid candidate generation (lexical/trigram shortlist from the 8k-food catalog → LLM
+    picks the best **or abstains**; abstain ⇒ stays unlinked, no guess). Interface + `Mock` + an eval
+    harness (non-deterministic, like the parsers, §2). The readout must surface the *chosen food's
+    description* because raw/cooked and skin/skinless swing macros hugely (drove the 97 g-fat/serving in
+    the Cacciatore test). This is **assisted linking, not autolinking** — the gate stays load-bearing.
+    It's also the §4.3 candidate→judgment→gate primitive that later slots fuzzy ingredient-matching into
+    `resolveCanonical`.
+  - **(C) Portion-based conversion backfill** *(the make-or-break, §4.2 #2)*: import FDC
+    `food_portion.csv` (confirmed present — 14.4k rows in SR Legacy: `amount`+`measure_unit`/`modifier`
+    → `gram_weight`) and, for each *confirmed* link, derive the ingredient's `density_g_per_ml` /
+    `grams_per_each` (`1 cup = 240 g` → density; `1 clove = 3 g` → each). Turns *linked-but-unconvertible*
+    lines complete without hand-entered densities.
+  - **Definition of done is honest, not 100%:** "every recipe **complete, or partial for a genuinely
+    uncountable reason**" (bay leaf, "to taste", "serve with pasta/potatoes"). Add a per-line
+    `not-nutrition-relevant` resolution (mirroring `resolve-line`) so those stop counting against
+    completeness — otherwise the dashboard nags forever and invites fabrication. Loop A→(B,C)→A until it
+    converges green.
 
 ---
 
@@ -755,7 +816,7 @@ because that's expensive to unwind once data piles up.
 | Both | Cross-photo duplicate (same recipe/receipt re-shot → different hash, not deduped) | Content-hash can't catch it; title/line similarity is a later nicety. |
 | Recipes | Steps/instructions not captured (ingredients-list-first) | Original image retained; re-parse when the cooking/preservation phase lands. |
 | Quality | **Recipe** parser eval harness (receipt eval shipped 2026-06-30; recipe one is the symmetric follow-up) | Scorer in `shared/eval.ts` generalizes; recipe lines need their own field checks (prepNote/optional, no price). Retained images + `raw_json` mean fixtures are free to backfill. |
-| Nutrition | Grow `foods` past the 9 manual seeds via a real **USDA FDC** import (keyed by `fdc_id`); could also seed `density_g_per_ml` / `grams_per_each` from FDC portion data | Reference data, re-derivable; the gated `food_id` links survive a catalog swap (§6, §10). |
+| Nutrition | ~~Grow `foods` past the 9 manual seeds via a real **USDA FDC** import (keyed by `fdc_id`)~~ **→ built 2026-07-01 (SR Legacy + Foundation, §11).** Still open: seed `density_g_per_ml` / `grams_per_each` from FDC `food_portion.csv` | Reference data, re-derivable; the gated `food_id` links survive a catalog swap (§6, §10). Portion→conversion backfill deferred to its own slice (§4.2 #2). |
 
 **Deferred non-blocking code cleanups** (flagged in the 2026-06-30 review; low risk, easily rediscovered, recorded so they aren't silently lost):
 

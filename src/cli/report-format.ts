@@ -3,6 +3,7 @@ import type {
   CheapestStoreReport,
   StoreCoverageRow,
   ProteinPerDollarReport,
+  NutritionCoverageReport,
 } from "../shared/reports";
 import type { PricedIngredient } from "../db/db";
 
@@ -133,5 +134,54 @@ export function formatDashboard(
   if (priced.length > 15) out.push(`  ...and ${priced.length - 15} more`);
   out.push("");
   out.push("Commands: report -- price <id> | cheapest <id> | stores | macros [id] | protein-per-dollar");
+  return out;
+}
+
+export function formatNutritionCoverage(report: NutritionCoverageReport): string[] {
+  const out = [
+    `Nutrition coverage — ${report.recipeCount} recipes: ` +
+      `${report.complete} complete, ${report.partial} partial`,
+  ];
+  if (report.recipeCount === 0) {
+    out.push("  (no recipes yet)");
+    return out;
+  }
+
+  const blockedTotal = report.blockedLines.noFoodLink + report.blockedLines.unconvertible;
+  out.push(
+    `  lines: ${report.countedLines} counted · ` +
+      `${report.blockedLines.noFoodLink} need a food link · ` +
+      `${report.blockedLines.unconvertible} need a conversion`,
+  );
+  if (report.linkableToComplete > 0) {
+    out.push(
+      `  ${report.linkableToComplete} partial recipe(s) would complete by linking alone (best case)`,
+    );
+  }
+
+  const worst = report.recipes.filter((r) => !r.complete).slice(0, 8);
+  if (worst.length > 0) {
+    out.push("", "  recipes needing the most work:");
+    for (const r of worst) {
+      out.push(
+        `    #${r.recipeId}  ${r.title ?? "(untitled)"}  —  ` +
+          `${r.counted}/${r.total} lines counted (${r.blocked} blocked)` +
+          (r.linkableToComplete ? "  ·  links only" : ""),
+      );
+    }
+  }
+
+  if (report.topUnlinked.length > 0) {
+    out.push("", "  link these ingredients next (most recipe lines unblocked first):");
+    for (const i of report.topUnlinked) {
+      out.push(
+        `    #${i.ingredientId}  ${i.ingredientName}  —  ` +
+          `${i.blockedLines} line(s) · ${i.recipes} recipe(s)`,
+      );
+    }
+    out.push("    → propose a link:  npm run review -- foods <query>  then  link-food <ing-id> <food-id>");
+  } else if (blockedTotal === 0) {
+    out.push("  ✓ every non-optional line is counted");
+  }
   return out;
 }

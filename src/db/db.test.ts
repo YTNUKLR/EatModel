@@ -584,6 +584,90 @@ test("fresh databases seed a small reference food catalog", () => {
   db.close();
 });
 
+const importFood = (fdcId: string, description: string, macros = { calories: 100, proteinG: 1, carbsG: 2, fatG: 3 }) => ({
+  fdcId,
+  description,
+  macros,
+});
+
+test("importFoods inserts usda foods and re-import updates rather than duplicating", () => {
+  const db = freshDb();
+  const first = db.importFoods([importFood("111", "Kale, raw")]);
+  assert.equal(first.inserted, 1);
+  const kale = db.listFoods("kale");
+  assert.equal(kale.length, 1);
+  assert.equal(kale[0]!.fdcId, "111");
+  assert.equal(kale[0]!.source, "usda_fdc");
+
+  const second = db.importFoods([
+    importFood("111", "Kale, raw", { calories: 49, proteinG: 4.3, carbsG: 8.8, fatG: 0.9 }),
+  ]);
+  assert.equal(second.inserted, 0);
+  assert.equal(second.updated, 1);
+  const kaleAgain = db.listFoods("kale");
+  assert.equal(kaleAgain.length, 1); // still one row
+  assert.equal(kaleAgain[0]!.nutrition.calories, 49); // macros refreshed
+  db.close();
+});
+
+test("importFoods replaces an unlinked manual seed sharing a description", () => {
+  const db = freshDb();
+  const before = db.listFoods("spinach")[0]!;
+  assert.equal(before.source, "manual");
+  assert.equal(before.fdcId, null);
+
+  db.importFoods([importFood("222", "Spinach, raw", { calories: 23, proteinG: 2.9, carbsG: 3.6, fatG: 0.4 })]);
+
+  const after = db.listFoods("spinach");
+  assert.equal(after.length, 1); // seed replaced, not duplicated
+  assert.equal(after[0]!.source, "usda_fdc");
+  assert.equal(after[0]!.fdcId, "222");
+  db.close();
+});
+
+test("recipeLineNutritionRows feeds coverage: excludes optional lines, flags confirmed links", () => {
+  const db = freshDb();
+  const summary = db.saveRecipe(
+    recipe([
+      ingredientLine("Chicken thighs", { quantity: 1, unit: "lb" }),
+      ingredientLine("Brandy", { quantity: 2, unit: "tbsp", optional: true }),
+    ]),
+    "r.jpg",
+    "mock",
+  );
+  const chickenLine = summary.lines[0]!;
+  db.proposeIngredientFoodLink(chickenLine.ingredientId!, db.listFoods("chicken")[0]!.id);
+  db.confirmIngredientFoodLink(chickenLine.ingredientId!);
+
+  const rows = db.recipeLineNutritionRows();
+  assert.equal(rows.length, 1); // optional brandy excluded
+  assert.equal(rows[0]!.ingredientName, "Chicken thighs");
+  assert.equal(rows[0]!.hasConfirmedFood, true);
+  assert.equal(rows[0]!.unit, "lb");
+  db.close();
+});
+
+test("importFoods never clobbers a manual seed an ingredient already links to", () => {
+  const db = freshDb();
+  const summary = db.saveRecipe(
+    recipe([ingredientLine("Chicken thighs", { quantity: 1, unit: "lb" })]),
+    "r.jpg",
+    "mock",
+  );
+  const chicken = db.listFoods("chicken")[0]!;
+  db.proposeIngredientFoodLink(summary.lines[0]!.ingredientId!, chicken.id);
+  db.confirmIngredientFoodLink(summary.lines[0]!.ingredientId!);
+
+  const res = db.importFoods([importFood("333", "Chicken thighs, boneless skinless, raw")]);
+  assert.equal(res.skippedLinkedCollision, 1);
+  assert.equal(res.inserted, 0);
+
+  const chickenAfter = db.listFoods("chicken")[0]!;
+  assert.equal(chickenAfter.id, chicken.id); // same row, link intact
+  assert.equal(chickenAfter.source, "manual");
+  db.close();
+});
+
 test("food links are proposed first and only confirmed links feed nutrition", () => {
   const db = freshDb();
   const recipeSummary = db.saveRecipe(

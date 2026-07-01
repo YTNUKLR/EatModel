@@ -5,6 +5,7 @@ import {
   cheapestStores,
   rankStoreCoverage,
   proteinPerDollar,
+  summarizeNutritionCoverage,
 } from "../shared/reports";
 import {
   formatPriceHistory,
@@ -12,6 +13,7 @@ import {
   formatStoreCoverage,
   formatProteinPerDollar,
   formatDashboard,
+  formatNutritionCoverage,
 } from "./report-format";
 import { formatRecipeNutrition } from "./nutrition-format";
 
@@ -28,6 +30,7 @@ const USAGE = `Reports — read-only views over the ingredient/price/nutrition s
   npm run report -- cheapest <id>      cheapest confirmed store for an ingredient
   npm run report -- stores             per-store price-data coverage
   npm run report -- macros [recipe-id] recipe macro rollups (all, or one)
+  npm run report -- coverage           nutrition completeness + what to link next
   npm run report -- protein-per-dollar cost-per-nutrient diagnostic + blockers
 `;
 
@@ -87,6 +90,11 @@ function main(): void {
           (a, b) => (b.nutrition.perServing?.proteinG ?? -1) - (a.nutrition.perServing?.proteinG ?? -1),
         );
         console.log(ranked.map((s) => formatRecipeNutrition(s).join("\n")).join("\n\n"));
+        break;
+      }
+      case "coverage": {
+        const report = summarizeNutritionCoverage(db.recipeLineNutritionRows());
+        console.log(formatNutritionCoverage(report).join("\n"));
         break;
       }
       case "protein-per-dollar": {

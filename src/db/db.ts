@@ -20,6 +20,7 @@ import type {
   StorePriceRow,
   StoreCoverageRow,
   ProteinPerDollarCandidate,
+  RecipeLineNutritionRow,
 } from "../shared/reports";
 import type { ReceiptParseResult } from "../shared/types";
 import type { RecipeParseResult, RecipePage } from "../shared/recipe-types";
@@ -369,6 +370,22 @@ export interface Food {
   description: string;
   source: "manual" | "usda_fdc";
   nutrition: Macros;
+}
+
+/** One reference food to import, shape-compatible with `parser/fdc.ts` output. */
+export interface ImportFood {
+  fdcId: string;
+  description: string;
+  macros: Macros;
+}
+
+export interface FoodImportResult {
+  inserted: number;
+  updated: number;
+  /** Skipped because an already-linked manual seed owns the same description (judgment protected). */
+  skippedLinkedCollision: number;
+  /** Skipped because another catalog row already holds this exact description. */
+  skippedDuplicateDescription: number;
 }
 
 export interface ProposedFoodLink {
@@ -1073,6 +1090,73 @@ export class Db {
     }));
   }
 
+  /**
+   * Bulk-import USDA FDC reference foods (ARCHITECTURE §11 2026-07-01). Idempotent
+   * and keyed by `fdc_id` — re-running refreshes macros rather than duplicating.
+   * `foods.description` is also UNIQUE, so a USDA row can collide with an existing
+   * row of the same description carrying a different (or null) fdc_id:
+   *   - an *unlinked manual seed* → replaced (the seeds are USDA-derived anyway, §14);
+   *   - a manual seed an ingredient already *links* to → skipped, never clobbered
+   *     (accumulated judgment outlives a catalog swap, §14 triage);
+   *   - another usda_fdc row → skipped (first description wins).
+   * All in one transaction.
+   */
+  importFoods(foods: ImportFood[]): FoodImportResult {
+    const upsert = this.db.prepare(
+      `INSERT INTO foods
+         (fdc_id, description, source, calories_per_100g, protein_g_per_100g, carbs_g_per_100g, fat_g_per_100g)
+       VALUES (?, ?, 'usda_fdc', ?, ?, ?, ?)
+       ON CONFLICT(fdc_id) DO UPDATE SET
+         description        = excluded.description,
+         source             = 'usda_fdc',
+         calories_per_100g  = excluded.calories_per_100g,
+         protein_g_per_100g = excluded.protein_g_per_100g,
+         carbs_g_per_100g   = excluded.carbs_g_per_100g,
+         fat_g_per_100g     = excluded.fat_g_per_100g`,
+    );
+    const byFdc = this.db.prepare("SELECT 1 FROM foods WHERE fdc_id = ?");
+    const byDesc = this.db.prepare(
+      "SELECT id, fdc_id AS fdcId, source FROM foods WHERE description = ?",
+    );
+    const isLinked = this.db.prepare("SELECT 1 FROM ingredients WHERE food_id = ? LIMIT 1");
+    const deleteFood = this.db.prepare("DELETE FROM foods WHERE id = ?");
+
+    const result: FoodImportResult = {
+      inserted: 0,
+      updated: 0,
+      skippedLinkedCollision: 0,
+      skippedDuplicateDescription: 0,
+    };
+
+    this.db.transaction(() => {
+      for (const f of foods) {
+        const existsByFdc = byFdc.get(f.fdcId) !== undefined;
+        const descRow = byDesc.get(f.description) as
+          | { id: number; fdcId: string | null; source: string }
+          | undefined;
+        // A description collision with a *different* row must be resolved first —
+        // otherwise the UNIQUE(description) constraint would throw.
+        if (descRow && descRow.fdcId !== f.fdcId) {
+          if (isLinked.get(descRow.id) !== undefined) {
+            result.skippedLinkedCollision++;
+            continue;
+          }
+          if (descRow.source === "manual") {
+            deleteFood.run(descRow.id);
+          } else {
+            result.skippedDuplicateDescription++;
+            continue;
+          }
+        }
+        upsert.run(f.fdcId, f.description, f.macros.calories, f.macros.proteinG, f.macros.carbsG, f.macros.fatG);
+        if (existsByFdc) result.updated++;
+        else result.inserted++;
+      }
+    })();
+
+    return result;
+  }
+
   /** Propose an ingredient → reference food link. It is not trusted until confirmed. */
   proposeIngredientFoodLink(ingredientId: number, foodId: number): void {
     const foodExists = this.db.prepare("SELECT 1 FROM foods WHERE id = ?").get(foodId) !== undefined;
@@ -1238,6 +1322,30 @@ export class Db {
       .prepare("SELECT id AS recipeId FROM recipes ORDER BY id")
       .all() as { recipeId: number }[];
     return recipes.map((r) => this.recipeNutrition(r.recipeId));
+  }
+
+  /**
+   * Every non-optional recipe line with the facts the coverage report needs to
+   * classify it (confirmed food link + conversion hints). Flat feed; the
+   * per-recipe/per-ingredient aggregation is pure in `summarizeNutritionCoverage`.
+   */
+  recipeLineNutritionRows(): RecipeLineNutritionRow[] {
+    const rows = this.db
+      .prepare(
+        `SELECT ri.recipe_id AS recipeId, r.title AS recipeTitle,
+                i.id AS ingredientId, i.canonical_name AS ingredientName,
+                ri.quantity AS quantity, ri.unit AS unit,
+                CASE WHEN i.food_id IS NOT NULL AND i.food_link_status = 'confirmed'
+                     THEN 1 ELSE 0 END AS hasConfirmedFood,
+                i.density_g_per_ml AS densityGPerMl, i.grams_per_each AS gramsPerEach
+         FROM recipe_ingredients ri
+         JOIN recipes r ON r.id = ri.recipe_id
+         JOIN ingredients i ON i.id = ri.ingredient_id
+         WHERE ri.optional = 0
+         ORDER BY ri.recipe_id, ri.id`,
+      )
+      .all() as (Omit<RecipeLineNutritionRow, "hasConfirmedFood"> & { hasConfirmedFood: number })[];
+    return rows.map((r) => ({ ...r, hasConfirmedFood: r.hasConfirmedFood === 1 }));
   }
 
   /** Mark a flagged line as reviewed. The original reason stays in raw data/history. */

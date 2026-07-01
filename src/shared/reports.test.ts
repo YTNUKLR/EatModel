@@ -6,6 +6,8 @@ import {
   rankStoreCoverage,
   proteinPerDollar,
   categorizeBlocker,
+  summarizeNutritionCoverage,
+  type RecipeLineNutritionRow,
   type PriceObservationRow,
   type StorePriceRow,
   type StoreCoverageRow,
@@ -178,4 +180,86 @@ test("categorizeBlocker maps engine reasons to stable categories", () => {
   assert.equal(categorizeBlocker('clove needs grams_per_each'), "missing grams-per-each");
   assert.equal(categorizeBlocker('unconvertible unit "sprig"'), "unconvertible unit");
   assert.equal(categorizeBlocker("no confirmed store"), "no confirmed store");
+});
+
+// ── Nutrition coverage ────────────────────────────────────────────────────────
+
+function covLine(
+  recipeId: number,
+  ingredientId: number,
+  ingredientName: string,
+  fields: Partial<RecipeLineNutritionRow> = {},
+): RecipeLineNutritionRow {
+  return {
+    recipeId,
+    recipeTitle: fields.recipeTitle ?? `Recipe ${recipeId}`,
+    ingredientId,
+    ingredientName,
+    quantity: fields.quantity ?? 1,
+    unit: fields.unit ?? "lb", // mass → convertible with a food link
+    hasConfirmedFood: fields.hasConfirmedFood ?? true,
+    densityGPerMl: fields.densityGPerMl ?? null,
+    gramsPerEach: fields.gramsPerEach ?? null,
+  };
+}
+
+test("coverage: a recipe with all lines linked+convertible is complete", () => {
+  const report = summarizeNutritionCoverage([
+    covLine(1, 10, "chicken"),
+    covLine(1, 11, "rice", { unit: "g" }),
+  ]);
+  assert.equal(report.recipeCount, 1);
+  assert.equal(report.complete, 1);
+  assert.equal(report.partial, 0);
+  assert.equal(report.countedLines, 2);
+  assert.equal(report.recipes[0]!.complete, true);
+});
+
+test("coverage: splits blockers into no-link vs unconvertible", () => {
+  const report = summarizeNutritionCoverage([
+    covLine(1, 10, "chicken"), // counted (mass + link)
+    covLine(1, 11, "onion", { hasConfirmedFood: false }), // no food link
+    covLine(1, 12, "olive oil", { unit: "cup" }), // linked but no density → unconvertible
+  ]);
+  assert.equal(report.complete, 0);
+  assert.equal(report.partial, 1);
+  assert.equal(report.countedLines, 1);
+  assert.equal(report.blockedLines.noFoodLink, 1);
+  assert.equal(report.blockedLines.unconvertible, 1);
+  // Has an unconvertible blocker → not linkable-to-complete.
+  assert.equal(report.recipes[0]!.linkableToComplete, false);
+});
+
+test("coverage: a recipe blocked only by missing links is linkable-to-complete", () => {
+  const report = summarizeNutritionCoverage([
+    covLine(1, 10, "chicken", { hasConfirmedFood: false }),
+    covLine(1, 11, "onion", { hasConfirmedFood: false }),
+  ]);
+  assert.equal(report.partial, 1);
+  assert.equal(report.linkableToComplete, 1);
+  assert.equal(report.recipes[0]!.linkableToComplete, true);
+});
+
+test("coverage: ranks unlinked ingredients by blocked lines across recipes", () => {
+  const report = summarizeNutritionCoverage([
+    covLine(1, 20, "onion", { hasConfirmedFood: false }),
+    covLine(2, 20, "onion", { hasConfirmedFood: false }),
+    covLine(3, 20, "onion", { hasConfirmedFood: false }),
+    covLine(1, 21, "butter", { hasConfirmedFood: false }),
+    covLine(2, 21, "butter", { hasConfirmedFood: false }),
+    covLine(1, 22, "chicken"), // linked → not in the queue
+  ]);
+  assert.equal(report.topUnlinked[0]!.ingredientName, "onion");
+  assert.equal(report.topUnlinked[0]!.blockedLines, 3);
+  assert.equal(report.topUnlinked[0]!.recipes, 3);
+  assert.equal(report.topUnlinked[1]!.ingredientName, "butter");
+  assert.equal(report.topUnlinked[1]!.blockedLines, 2);
+  assert.ok(!report.topUnlinked.some((i) => i.ingredientName === "chicken"));
+});
+
+test("coverage: topN caps the work queue", () => {
+  const rows: RecipeLineNutritionRow[] = [];
+  for (let i = 0; i < 30; i++) rows.push(covLine(1, 100 + i, `ing${i}`, { hasConfirmedFood: false }));
+  const report = summarizeNutritionCoverage(rows, 5);
+  assert.equal(report.topUnlinked.length, 5);
 });
