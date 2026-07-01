@@ -15,6 +15,8 @@ const USAGE = `Review gate — inspect and resolve what the ingest flagged.
                                   fold ingredient <from> into <into> (de-fragment the spine)
   npm run review -- delete-recipe <id>
                                   delete a mis-captured recipe + the ingredients it orphans
+  npm run review -- set-source <recipe-id> <source text...>
+                                  record a recipe's source citation (book/page); omit text to clear
   npm run review -- confirm-store <id>
                                   mark store <id> as confirmed
   npm run review -- merge-store <from> <into>
@@ -170,6 +172,13 @@ function main(): void {
         );
       }
       if (summary.deletedIngest) console.log(`  removed the now-empty image ingest`);
+    } else if (cmd === "set-source") {
+      const id = intArg(rest[0], "recipe id");
+      const source = rest.slice(1).join(" ").trim();
+      db.setRecipeSource(id, source === "" ? null : source);
+      console.log(
+        source === "" ? `✓ cleared source of recipe #${id}` : `✓ set source of recipe #${id}: ${source}`,
+      );
     } else if (cmd === "confirm-store") {
       const id = intArg(rest[0], "store id");
       db.confirmStore(id);

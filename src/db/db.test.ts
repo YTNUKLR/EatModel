@@ -552,6 +552,26 @@ test("delete-recipe rejects an unknown recipe id", () => {
   db.close();
 });
 
+// --- set-source ----------------------------------------------------------
+
+test("set-source records a recipe citation, round-trips, and clears on blank", () => {
+  const db = freshDb();
+  const s = db.saveRecipe(recipe([ingredientLine("Butter")]), "r.jpg", "mock", "r");
+
+  db.setRecipeSource(s.recipeId, "  Joy of Cooking, p. 412  ");
+  assert.equal(db.recipeNutrition(s.recipeId).source, "Joy of Cooking, p. 412"); // trimmed
+
+  db.setRecipeSource(s.recipeId, "   "); // blank clears back to null
+  assert.equal(db.recipeNutrition(s.recipeId).source, null);
+  db.close();
+});
+
+test("set-source rejects an unknown recipe id", () => {
+  const db = freshDb();
+  assert.throws(() => db.setRecipeSource(9999, "Joy of Cooking"), /no recipe/);
+  db.close();
+});
+
 // --- Nutrition ----------------------------------------------------------
 
 test("fresh databases seed a small reference food catalog", () => {

@@ -22,7 +22,8 @@ Two photo-ingest slices are live, both feeding the same SQLite spine via the `db
 - **Review / confidence gate (§5.5)** — new ingredients persist as `status='unconfirmed'`; untrustworthy
   lines are **flagged, not dropped** (and never become price facts); receipt totals are reconciled.
   Resolve via `npm run review` (`list` / `confirm <id>` / `merge <from> <into>` /
-  `delete-recipe <id>` / `resolve-line <receipt|recipe> <id>` / `resolve-receipt <id>`).
+  `delete-recipe <id>` / `set-source <recipe-id> <text>` / `resolve-line <receipt|recipe> <id>` /
+  `resolve-receipt <id>`).
 
 **Next identity decision, not yet built:** a **store-identity spine** for receipts (`receipts.store` is
 still free text, which blocks "cheapest store"). See `ARCHITECTURE.md` §14 for the full deferred backlog.

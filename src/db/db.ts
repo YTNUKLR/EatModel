@@ -386,6 +386,7 @@ export interface IngredientMissingFoodLink {
 export interface RecipeNutritionSummary {
   recipeId: number;
   title: string | null;
+  source: string | null;
   servings: number | null;
   nutrition: NutritionRollup;
 }
@@ -1122,6 +1123,20 @@ export class Db {
     if (res.changes === 0) throw new Error(`no ingredient with id ${ingredientId}`);
   }
 
+  /**
+   * Set (or clear) a recipe's human-readable source citation — the book/page
+   * the parser couldn't read off the page (often because it wasn't in frame).
+   * A blank string clears it back to null. Free text by design: it mirrors what
+   * the parser writes and there's no source spine yet.
+   */
+  setRecipeSource(recipeId: number, source: string | null): void {
+    const trimmed = source == null ? null : source.trim() === "" ? null : source.trim();
+    const res = this.db
+      .prepare("UPDATE recipes SET source_note = ? WHERE id = ?")
+      .run(trimmed, recipeId);
+    if (res.changes === 0) throw new Error(`no recipe with id ${recipeId}`);
+  }
+
   listProposedFoodLinks(): ProposedFoodLink[] {
     return this.db
       .prepare(
@@ -1148,8 +1163,10 @@ export class Db {
 
   recipeNutrition(recipeId: number): RecipeNutritionSummary {
     const recipe = this.db
-      .prepare("SELECT id AS recipeId, title, servings FROM recipes WHERE id = ?")
-      .get(recipeId) as { recipeId: number; title: string | null; servings: number | null } | undefined;
+      .prepare("SELECT id AS recipeId, title, source_note AS source, servings FROM recipes WHERE id = ?")
+      .get(recipeId) as
+      | { recipeId: number; title: string | null; source: string | null; servings: number | null }
+      | undefined;
     if (!recipe) throw new Error(`no recipe with id ${recipeId}`);
 
     const rows = this.db

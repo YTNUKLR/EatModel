@@ -18,7 +18,8 @@ export function formatRecipeNutrition(summary: RecipeNutritionSummary): string[]
   const title = summary.title ?? "(untitled recipe)";
   const { total, perServing, countedLines, missedLines } = summary.nutrition;
   const marker = summary.nutrition.partial ? "⚠ partial" : "complete";
-  const lines = [`recipe #${summary.recipeId}  ${title}  —  nutrition ${marker}`];
+  const src = summary.source ? `  ·  ${summary.source}` : "";
+  const lines = [`recipe #${summary.recipeId}  ${title}${src}  —  nutrition ${marker}`];
 
   // When some lines were skipped, the total/per-serving are floors, not the real
   // figure — annotate them so the number isn't read as authoritative.
