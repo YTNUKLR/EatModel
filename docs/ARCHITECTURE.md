@@ -867,9 +867,14 @@ because that's expensive to unwind once data piles up.
 
 ---
 
-## 15. Report slice plan (next build) — read-only query layer
+## 15. Report slice plan — read-only query layer
 
-Status: **planned, not built** (2026-06-30). This is the "Next useful build" from §14. It's chosen over
+Status: **built** (2026-07-01, branch `feat/report-slice`). The `report` CLI ships all tiers below:
+Tier 1 (`price` / `cheapest` / `stores`), Tier 2 (`macros`), and Tier 3 (`protein-per-dollar` diagnostic),
+plus the `coverage` dashboard added by the nutrition-coverage plan (§11, 2026-07-01). Pure logic lives in
+`shared/reports.ts` (TDD'd, `reports.test.ts`), formatting in `cli/report-format.ts`, read-only db methods
+in `db.ts`, thin dispatch in `cli/report.ts`. `npm run check` green. The plan below is retained as the
+design record. This was the "Next useful build" from §14 — chosen over
 every other backlog item because it's the first slice that turns the accumulated spine into user-visible
 payoff (store identity has produced *zero* payoff until a cost view consumes it — §11, 2026-06-30), it's
 the lowest-risk slice on the board (**read-only**: no new identity to mint, no accumulated judgment to

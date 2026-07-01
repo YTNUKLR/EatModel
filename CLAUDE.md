@@ -11,7 +11,7 @@ recipes, grocery, pantry, and receipts. All-TypeScript, greenfield, in the **dis
 package whose folders (`shared/ parser/ db/ cli/`) mirror future `packages/*`. SQLite behind a repository
 layer (Postgres/Drizzle deferred). Python deferred behind interfaces.
 
-## Current state (as of 2026-06-29)
+## Current state (as of 2026-07-01)
 
 Two photo-ingest slices are live, both feeding the same SQLite spine via the `db/` repository:
 
@@ -29,6 +29,10 @@ Two photo-ingest slices are live, both feeding the same SQLite spine via the `db
   (`npm run import-foods -- <unzipped-bundle-dir>`). **Assisted linking**: `review -- link-suggest` (lexical
   shortlist → LLM picks or abstains → gated proposal). Coverage: `npm run report -- coverage`.
 - **Store-identity spine (§14)** — `stores`/`store_aliases`, `receipts.store_id`; `confirm-store`/`merge-store`.
+- **Report slice (§15)** — read-only query layer over the spine: `npm run report -- price | cheapest |
+  stores | macros | coverage | protein-per-dollar`. Pure ranking/gap logic in `shared/reports.ts` (TDD'd);
+  reads **confirmed** data only, shows gaps rather than fabricating (`protein-per-dollar` is a conversion-gated
+  diagnostic that tallies typed blockers).
 
 **Next up:** the systematic-nutrition-coverage three-lever plan (ARCHITECTURE §11 2026-07-01) is **built**
 (coverage dashboard + assisted linker + portion backfill); remaining polish = a FoodLinker eval harness and
